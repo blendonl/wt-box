@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# switch-worktree-lite — fuzzy switch between a project's git worktrees, as
+# plain sessions on the *default* tmux server.
+#
+# switch-worktree is the podman/compose picker: one dev container per worktree,
+# sessions named "project~branch" on a per-project tmux socket.  This is its
+# box-lite counterpart — the same fuzzy-pick-a-worktree gesture, but every
+# worktree is just another session on the single default server, so switching
+# is a switch-client (instant) and `tmux ls` shows every worktree in one place.
+#
+# Naming follows box-lite and wt-box rather than switch-worktree's "~":
+#
+#   <project>                 main worktree,   host network      (enter)
+#   <project>-<branch>        linked worktree, host network      (enter)
+#   <project>-<branch>@net    linked worktree, own LAN IP        (ctrl-i)
+#
+# The box name doubles as a netns name and a hostname once isolated, so it has
+# to stay slug-safe — "~" never appears.  The main worktree deliberately keeps
+# the bare project name, so picking a project in box-lite and picking its main
+# worktree here land on the same session.
+#
+# The project half of the name comes from box-lite, which spells it from the
+# path below the project root and disambiguates two roots claiming one name.
+# wt-box slugifies the repo directory name instead, so for a flat repo the two
+# agree exactly (same box, netns and IP) but for a nested repo they do not:
+# this calls it "raw-rawaccel" where `wt-box up` would say "rawaccel".
+#
+#   enter   → shared session   host network, instant
+#   ctrl-i  → isolated session own LAN IP via ensure-box
+#             (alt-i does the same; terminals send Ctrl-I as Tab, so Tab too)
+#
+# Session creation and attach are delegated to box-lite (--ensure / --switch)
+# so the netns entry command, the shared-server guard and the @net convention
+# live in exactly one place.
+#
+# NOTE: `wt-box up` does the fuller setup for a linked worktree — it also
+#       symlinks the main worktree's .env files in and registers
+#       <box>.wt.test with dnsmasq.  This only moves you between sessions.
+
+set -euo pipefail
+
+# Non-login shells (like those inside tmux) may have a sparse PATH.
+export PATH="/usr/local/bin:/usr/bin:$HOME/.local/bin:$HOME/bin:$PATH"
+
+SCRIPT_PATH="$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
+
+# ── Container detection ────────────────────────────────────────────────────
+# Inside a dev container, bridge to the host via tmux so discovery and box
+# state come from the host (same pattern as box-lite / switch-worktree).
+
+_in_container=false
+[[ -n "${CONTAINER_ID:-}" ]] && _in_container=true
+[[ -n "${DISTROBOX_ENTER:-}" ]] && _in_container=true
+[[ -f /run/.containerenv ]] && _in_container=true
+
+if $_in_container; then
+    if [[ -z "${TMUX:-}" ]]; then
+        echo "ERROR: Running inside a container but outside tmux." >&2
+        echo "       'switch-worktree-lite' needs a tmux session to bridge to the host." >&2
+        exit 1
+    fi
+    # ${TMUX%%,*} extracts the socket path from "path,pid,clientid".
+    exec tmux -S "${TMUX%%,*}" display-popup -h 30 -w 100 -E "${SCRIPT_PATH} $*"
+fi
+
+# ── Config ─────────────────────────────────────────────────────────────────
+
+BOX_LITE="/home/notpc/bin/box-lite"
+IP_STATE_FILE="/tmp/compose/ip-allocations.txt"
+NETNS_DIR="/var/run/netns"
+ISO_SUFFIX="@net"
+NAME_MAX=40
+
+# ── Keep the display-popup open on error so the message can be read ────────
+# The script is meant to run via "tmux display-popup -E", which closes the
+# popup the moment the command exits — a failing exit would flash the error
+# and vanish.  Pause on any non-zero exit instead.
+
+TMPF=""
+_cleanup() {
+    local code=$?
+    [[ -n "$TMPF" ]] && rm -f "$TMPF"
+    if (( code != 0 )); then
+        echo >&2
+        read -r -p "Press Enter to close..." _ 2>/dev/null || true
+    fi
+    exit "$code"
+}
+trap _cleanup EXIT
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# ── Dependencies ───────────────────────────────────────────────────────────
+
+for _cmd in git fzf tmux; do
+    command -v "$_cmd" >/dev/null 2>&1 \
+        || die "required command '${_cmd}' not found in PATH"
+done
+[[ -x "$BOX_LITE" ]] || die "box-lite not found at ${BOX_LITE}"
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+# Every tmux call goes to the default server explicitly: this may be run from
+# inside a legacy per-box server, where a bare `tmux` would target that one.
+tm() { tmux -L default "$@"; }
+
+# Single-quote a string for safe interpolation into a shell command.
+shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+netns_up() { [[ -e "${NETNS_DIR}/$1" ]]; }
+
+# Lowercase, non-alnum → '-', squeezed, trimmed, truncated.  Copied verbatim
+# from wt-box so that both tools derive byte-identical box names.
+slugify() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g; s/-{2,}/-/g' \
+        | cut -c1-"${NAME_MAX}" | sed -E 's/-+$//'
+}
+
+# ── State (sessions + IP allocations) ──────────────────────────────────────
+# Same cheap sources box-lite reads: one tmux call plus one file, no podman.
+
+declare -A SESS_WIN SESS_ATT BOX_IP
+
+load_state() {
+    local n w a ip
+    while IFS=$'\t' read -r n w a; do
+        [[ -z "$n" ]] && continue
+        SESS_WIN["$n"]="$w"
+        SESS_ATT["$n"]="$a"
+    done < <(tm list-sessions \
+        -F '#{session_name}'$'\t''#{session_windows}'$'\t''#{session_attached}' \
+        2>/dev/null || true)
+
+    if [[ -f "${IP_STATE_FILE}" ]]; then
+        while read -r n ip; do
+            [[ -n "$n" ]] && BOX_IP["$n"]="$ip"
+        done < "${IP_STATE_FILE}"
+    fi
+}
+
+# Sets TAG to "2w", "2w*" (attached) or "-".  Returns through a global rather
+# than stdout because $(…) forks a subshell and this runs twice per row.
+TAG=""
+session_tag() {
+    local sess="$1"
+    TAG="-"
+    [[ -z "${SESS_WIN[$sess]:-}" ]] && return 0
+    TAG="${SESS_WIN[$sess]}w"
+    [[ "${SESS_ATT[$sess]:-0}" == "1" ]] && TAG+="*"
+    return 0
+}
+
+# ── Locate the repository ──────────────────────────────────────────────────
+# The popup starts in the pane's directory, so $PWD is nearly always right;
+# ask tmux for the pane path as a fallback for the cases where it is not.
+
+SRC_DIR=""
+for _d in "$PWD" "$(tm display-message -p '#{pane_current_path}' 2>/dev/null || true)"; do
+    [[ -n "$_d" && -d "$_d" ]] || continue
+    git -C "$_d" rev-parse --git-common-dir >/dev/null 2>&1 || continue
+    SRC_DIR="$_d"
+    break
+done
+[[ -n "$SRC_DIR" ]] || die "not inside a git repository.
+       cd into a project worktree and try again, or press the box-lite
+       key to pick a project first."
+
+SHARED_GIT=$(git -C "$SRC_DIR" rev-parse --git-common-dir)
+if [[ "$SHARED_GIT" != /* ]]; then
+    SHARED_GIT=$(cd "$SRC_DIR" && { realpath "$SHARED_GIT" 2>/dev/null \
+        || readlink -f "$SHARED_GIT" 2>/dev/null || echo "$SRC_DIR/$SHARED_GIT"; })
+fi
+
+CURRENT_WT=$(git -C "$SRC_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+
+# Carry the subdirectory over when switching: from …/cadence/apps/web you land
+# in apps/web of the target worktree, when that directory exists there.
+REL_PATH=""
+if [[ -n "$CURRENT_WT" ]]; then
+    _src=$(cd "$SRC_DIR" && pwd -P)
+    _top=$(cd "$CURRENT_WT" && pwd -P)
+    [[ "$_src" == "$_top"/* ]] && REL_PATH="${_src#"$_top"/}"
+fi
+
+# ── Naming ─────────────────────────────────────────────────────────────────
+
+# The project's box name, exactly as box-lite's picker spells it — asking
+# box-lite keeps the root-relative naming and its collision handling
+# ("personal/foo" vs "work/foo") in one place instead of reimplementing them.
+# Falls back to the repo directory name for repos outside PROJECT_ROOTS.
+project_box_name() {
+    local main_wt="$1" display box wt
+    while IFS=$'\t' read -r display box wt _; do
+        [[ "$wt" == "$main_wt" ]] || continue
+        printf '%s\n' "$box"
+        return 0
+    done < <("$BOX_LITE" --list 2>/dev/null || true)
+    printf '%s\n' "$(slugify "${main_wt##*/}")"
+}
+
+# ── Enumerate worktrees ────────────────────────────────────────────────────
+# Parse `git worktree list --porcelain`; each block is:
+#   worktree <path>
+#   HEAD <hash>
+#   branch refs/heads/<name>   OR   detached
+# Parallel indexed arrays rather than one associative array, so that branch
+# names with awkward characters can never turn into a bad array subscript.
+
+WT_PATHS=()
+WT_BRANCHES=()
+MAIN_WT=""
+_wt=""
+while IFS= read -r line; do
+    case "$line" in
+        "worktree "*)
+            _wt="${line#worktree }"
+            # git always lists the main worktree first.
+            if [[ -z "$MAIN_WT" ]]; then MAIN_WT="$_wt"; fi
+            ;;
+        "branch refs/heads/"*)
+            WT_PATHS+=("$_wt")
+            WT_BRANCHES+=("${line#branch refs/heads/}")
+            ;;
+        "detached")
+            # Key detached worktrees off the directory name, not the commit:
+            # a sha-derived box name would drift on every commit and leak a
+            # fresh netns and IP each time.
+            WT_PATHS+=("$_wt")
+            WT_BRANCHES+=("[detached] ${_wt##*/}")
+            ;;
+    esac
+done < <(git --git-dir="$SHARED_GIT" worktree list --porcelain 2>/dev/null)
+
+((${#WT_PATHS[@]})) || die "no worktrees found for ${SHARED_GIT}"
+
+# ── Build the picker rows ──────────────────────────────────────────────────
+
+load_state
+PROJECT_BOX=$(project_box_name "$MAIN_WT")
+# Guard rather than go on to build "-<branch>" session names out of nothing.
+[[ -n "$PROJECT_BOX" ]] || die "could not derive a project name for ${MAIN_WT}"
+
+TMPF=$(mktemp /tmp/switch-worktree-lite.XXXXXX)
+
+# Each line is "<sortkey>\t<display>\t<box>\t<worktree>".  The sort key groups
+# regular branches ahead of detached ones and alphabetises within each group;
+# it is cut back off before fzf sees the line.
+for _i in "${!WT_PATHS[@]}"; do
+    wt="${WT_PATHS[$_i]}"
+    branch="${WT_BRANCHES[$_i]}"
+
+    if [[ "$wt" == "$MAIN_WT" ]]; then
+        box="$PROJECT_BOX"
+        grp=0
+    elif [[ "$branch" == "[detached]"* ]]; then
+        box="${PROJECT_BOX}-$(slugify "$branch")"
+        grp=1
+    else
+        box="${PROJECT_BOX}-$(slugify "$branch")"
+        grp=0
+    fi
+
+    mark=" "
+    [[ -n "$CURRENT_WT" && "$wt" == "$CURRENT_WT" ]] && mark="*"
+    session_tag "$box";                shared="$TAG"
+    session_tag "${box}${ISO_SUFFIX}"; iso="$TAG"
+    ip="${BOX_IP[$box]:--}"
+    ns="-"
+    netns_up "$box" && ns="up"
+
+    printf '%s%s\t%s %-32s %-7s %-8s %-16s %-5s\t%s\t%s\n' \
+        "$grp" "$branch" \
+        "$mark" "$branch" "$shared" "$iso" "$ip" "$ns" \
+        "$box" "$wt"
+done >> "$TMPF"
+
+[[ -s "$TMPF" ]] || die "no worktrees to show for '${PROJECT_BOX}'"
+
+# ── Pick ───────────────────────────────────────────────────────────────────
+
+header=$(printf '%s %-32s %-7s %-8s %-16s %-5s\n%s' \
+    " " "BRANCH" "SHARED" "ISOLATED" "IP" "NETNS" \
+    "${PROJECT_BOX}  —  enter:shared  ctrl-i:isolated  (* = current)")
+
+# Fields after the cut are 1=display, 2=box, 3=worktree, which is exactly the
+# contract box-lite's own preview helper expects.
+out=$(sort "$TMPF" | cut -f2- \
+    | fzf --prompt="worktree> " \
+          --header="${header}" \
+          --delimiter=$'\t' \
+          --with-nth=1 \
+          --expect=ctrl-i,alt-i \
+          --preview="$(shq "$BOX_LITE") --preview {2} {3}" \
+          --preview-window=down:8:wrap) || exit 0
+
+key=$(printf '%s' "$out" | head -1)
+selection=$(printf '%s' "$out" | sed -n '2p')
+[[ -z "$selection" ]] && exit 0
+
+BOX=$(printf '%s' "$selection" | awk -F'\t' '{print $2}')
+WT_DIR=$(printf '%s' "$selection" | awk -F'\t' '{print $3}')
+[[ -n "$BOX" && -n "$WT_DIR" ]] || exit 0
+
+TARGET_DIR="$WT_DIR"
+if [[ -n "$REL_PATH" && -d "$WT_DIR/$REL_PATH" ]]; then
+    TARGET_DIR="$WT_DIR/$REL_PATH"
+fi
+
+# ── Ensure the session, then switch ────────────────────────────────────────
+
+case "$key" in
+    ctrl-i|alt-i)
+        # Terminals send the same byte for Ctrl-I and Tab, so Tab isolates too;
+        # alt-i is the collision-free alternative.
+        SESSION=$("$BOX_LITE" --ensure "$BOX" --isolate --dir "$TARGET_DIR") ;;
+    *)
+        SESSION=$("$BOX_LITE" --ensure "$BOX" --dir "$TARGET_DIR") ;;
+esac
+[[ -n "$SESSION" ]] || die "box-lite --ensure '${BOX}' returned no session name"
+
+if [[ -n "${TMUX:-}" ]]; then
+    # Stay a normal child so a failure here still trips the pause-on-error trap.
+    "$BOX_LITE" --switch "$SESSION"
+else
+    exec "$BOX_LITE" --switch "$SESSION"
+fi

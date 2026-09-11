@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# box-vnc-pw — print the VNC password for box browser containers.
+#
+# Resolution order:
+#   1. $BOX_VNC_PW  — export it to use your own password
+#   2. /home/notpc/.ensure-box/vnc-pw — random, generated on first use (0600)
+#
+# ensure-box, ensure-compose and box-lite all go through this, so the password
+# the container gets and the one they print always agree — and none of them has
+# to carry a password in the repo.
+
+set -euo pipefail
+
+BOX_USER="notpc"
+PW_FILE="${BOX_VNC_PW_FILE:-/home/${BOX_USER}/.ensure-box/vnc-pw}"
+PW_LEN=16
+
+if [[ -n "${BOX_VNC_PW:-}" ]]; then
+    printf '%s\n' "${BOX_VNC_PW}"
+    exit 0
+fi
+
+if [[ ! -s "${PW_FILE}" ]]; then
+    PW_DIR="$(dirname "${PW_FILE}")"
+    mkdir -p "${PW_DIR}"
+
+    # 256 random bytes yield ~60 alphanumerics on average — plenty for 16.
+    pw="$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')"
+    pw="${pw:0:${PW_LEN}}"
+    [[ "${#pw}" -eq "${PW_LEN}" ]] || { echo "box-vnc-pw: could not generate a password" >&2; exit 1; }
+
+    (umask 077; printf '%s\n' "${pw}" > "${PW_FILE}")
+
+    # ensure-box runs under sudo, so the file may land root-owned — hand it to
+    # the user, otherwise the unprivileged scripts cannot read it back.
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown "${BOX_USER}:${BOX_USER}" "${PW_DIR}" "${PW_FILE}" 2>/dev/null || true
+    fi
+fi
+
+cat "${PW_FILE}"

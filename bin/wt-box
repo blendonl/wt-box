@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# wt-box — isolated test environment per git worktree.
+#
+# Spins up an ensure-box netns (own LAN IP) for a linked worktree, symlinks
+# the main worktree's .env files into it, registers <repo>-<branch>.wt.test
+# in the local dnsmasq hostsdir, and opens an isolated tmux session there.
+# Because every worktree has its own IP, each one uses the app's normal
+# port — the name in the URL is the distinguisher:
+#
+#   http://<repo>-<branch>.wt.test:<app-port>
+#
+# Usage:
+#   wt-box up [path]        create env for the worktree at path (default: cwd)
+#   wt-box down [path|name] stop env, release IP, unregister name
+#   wt-box list             show all worktree boxes
+#   wt-box url [path]       print the URL for a worktree
+#
+# One-time setup: sudo ensure-wt-dns   (dnsmasq + systemd-resolved routing)
+# Prerequisites : sudo ensure-macvlan  (host-side macvlan interface)
+
+set -euo pipefail
+
+ENSURE_BOX="/home/notpc/bin/ensure-box"
+BOX_LITE="/home/notpc/bin/box-lite"
+MACVLAN_CONF="/etc/podman/ensure-compose.conf"
+BOX_STATE_DIR="/tmp/ensure-box"
+STATE_DIR="/tmp/wt-box"
+HOSTS_DIR="/etc/wt-boxes.d"
+HOSTS_FILE="${HOSTS_DIR}/wt-boxes.hosts"
+DNS_TLD="wt.test"
+ISO_SUFFIX="@net"
+NAME_MAX=40
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# //'; exit 0; }
+
+tm() { tmux -L default "$@"; }
+
+# ── Naming ─────────────────────────────────────────────────────────────────
+
+# Lowercase, non-alnum → '-', squeezed, trimmed, truncated.
+slugify() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g; s/-{2,}/-/g' \
+        | cut -c1-"${NAME_MAX}" | sed -E 's/-+$//'
+}
+
+# Sets MAIN_WT, BRANCH for the repo containing $1.  Dies if not a git repo.
+git_info() {
+    local dir="$1"
+    [[ -d "$dir" ]] || die "not a directory: ${dir}"
+    git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 \
+        || die "not inside a git repository: ${dir}"
+    # First 'worktree' line of the porcelain output is always the main one.
+    MAIN_WT=$(git -C "$dir" worktree list --porcelain | awk '/^worktree /{print $2; exit}')
+    BRANCH=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    if [[ -z "$BRANCH" || "$BRANCH" == "HEAD" ]]; then
+        BRANCH="detached-$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    fi
+}
+
+# box name for a worktree path: <repo>-<branch-slug>
+box_name_for() {
+    local dir="$1"
+    git_info "$dir"
+    echo "$(slugify "$(basename "$MAIN_WT")")-$(slugify "$BRANCH")"
+}
+
+# Resolve an argument that may be a path or a bare box name → echo box name.
+resolve_name() {
+    local arg="${1:-$PWD}"
+    if [[ -d "$arg" ]]; then
+        box_name_for "$arg"
+    else
+        echo "$arg"
+    fi
+}
+
+# ── .env sync ──────────────────────────────────────────────────────────────
+
+# Symlink main worktree's .env* files into the linked worktree.  Never
+# overwrites: a worktree-local file (or symlink) always wins.
+sync_env_files() {
+    local main_wt="$1" wt="$2" f base linked=0
+    for f in "$main_wt"/.env*; do
+        [[ -f "$f" ]] || continue
+        base=$(basename "$f")
+        case "$base" in
+            *.example|*.sample|*.dist) continue ;;
+        esac
+        if [[ ! -e "${wt}/${base}" && ! -L "${wt}/${base}" ]]; then
+            ln -s "$f" "${wt}/${base}"
+            echo "  linked ${base} → ${f}"
+            linked=$((linked + 1))
+        fi
+    done
+    [[ "$linked" == "0" ]] && echo "  .env: nothing to link (already present or none in main worktree)"
+}
+
+# ── DNS registration ───────────────────────────────────────────────────────
+# Regenerated from live ensure-box state on every up/down, so stale entries
+# left over from a reboot (/tmp is per-boot) disappear on their own.
+
+regen_hosts() {
+    [[ -d "${HOSTS_DIR}" ]] || die "${HOSTS_DIR} missing — run 'sudo ensure-wt-dns' first."
+    local tmp state
+    tmp=$(mktemp)
+    for state in "${BOX_STATE_DIR}"/*/state; do
+        [[ -f "$state" ]] || continue
+        BOX_NAME=""; BOX_IP=""
+        # shellcheck source=/dev/null
+        source "$state"
+        [[ -n "${BOX_NAME:-}" && -n "${BOX_IP:-}" ]] || continue
+        # Skip host-mode boxes — they share the host's network, there is
+        # no per-box IP to publish.
+        [[ "${BOX_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+        printf '%s\t%s.%s\n' "${BOX_IP}" "${BOX_NAME}" "${DNS_TLD}" >> "$tmp"
+    done
+    install -m 644 "$tmp" "${HOSTS_FILE}"
+    rm -f "$tmp"
+}
+
+# ── State ──────────────────────────────────────────────────────────────────
+
+save_state() {
+    local box="$1" wt="$2"
+    mkdir -p "${STATE_DIR}"
+    cat > "${STATE_DIR}/${box}" <<EOF
+BOX_NAME=${box}
+WORKTREE=${wt}
+MAIN_WT=${MAIN_WT}
+BRANCH=${BRANCH}
+EOF
+}
+
+# ── URL ────────────────────────────────────────────────────────────────────
+
+# First PORT-ish value found in the worktree's effective .env, if any.
+detect_port() {
+    local wt="$1" port=""
+    if [[ -f "${wt}/.env" ]]; then
+        port=$(grep -m1 -oE '^(PORT|APP_PORT|HTTP_PORT|SERVER_PORT)=[0-9]+' "${wt}/.env" 2>/dev/null | cut -d= -f2 || true)
+    fi
+    echo "${port:-<port>}"
+}
+
+print_url() {
+    local box="$1" wt="$2"
+    echo "http://${box}.${DNS_TLD}:$(detect_port "$wt")"
+}
+
+# ── Commands ───────────────────────────────────────────────────────────────
+
+cmd_up() {
+    local dir="${1:-$PWD}"
+    dir=$(realpath "$dir")
+    git_info "$dir"
+
+    [[ -f "${MACVLAN_CONF}" ]] \
+        || die "no macvlan config at ${MACVLAN_CONF} — run 'sudo ensure-macvlan' first."
+    ip link show mac-host >/dev/null 2>&1 \
+        || die "no 'mac-host' interface — run 'sudo ensure-macvlan' first."
+
+    if [[ "$dir" == "$MAIN_WT" ]]; then
+        echo "wt-box: '$dir' is the main worktree — no isolation needed."
+        echo "        opening a plain shared session via box-lite instead."
+        exec "${BOX_LITE}" --ensure "$(slugify "$(basename "$MAIN_WT")")" --dir "$dir"
+    fi
+
+    local box sess
+    box="$(slugify "$(basename "$MAIN_WT")")-$(slugify "$BRANCH")"
+    echo "wt-box up: ${box}"
+    echo "  worktree : ${dir}"
+    echo "  main     : ${MAIN_WT} (${BRANCH})"
+
+    echo "  syncing .env from main worktree:"
+    sync_env_files "$MAIN_WT" "$dir"
+
+    sudo -n "${ENSURE_BOX}" --no-tmux --no-enter --dir "$dir" "$box" \
+        || die "ensure-box failed to bring up '${box}'."
+
+    save_state "$box" "$dir"
+    regen_hosts
+
+    sess=$("${BOX_LITE}" --ensure "$box" --isolate --dir "$dir")
+    tm set-environment -t "$sess" COMPOSE_PROJECT_NAME "$box" 2>/dev/null || true
+
+    echo "  session  : ${sess}"
+    echo "  url      : $(print_url "$box" "$dir")"
+
+    if [[ -n "${TMUX:-}" ]]; then
+        tm switch-client -t "=${sess}" 2>/dev/null || true
+    fi
+}
+
+cmd_down() {
+    local box
+    box=$(resolve_name "${1:-}")
+    echo "wt-box down: ${box}"
+
+    local s
+    for s in "$box" "${box}${ISO_SUFFIX}"; do
+        tm kill-session -t "=$s" 2>/dev/null || true
+    done
+
+    sudo -n "${ENSURE_BOX}" stop --rm "$box" \
+        || echo "  warning: ensure-box stop failed (box already gone?)" >&2
+
+    rm -f "${STATE_DIR}/${box}"
+    regen_hosts
+    echo "  released IP and unregistered ${box}.${DNS_TLD}"
+}
+
+cmd_list() {
+    local state box wt ip
+    printf '%-40s %-15s %-8s %s\n' "NAME" "IP" "SESSION" "WORKTREE"
+    for state in "${STATE_DIR}"/*; do
+        [[ -f "$state" ]] || continue
+        box=""; wt=""
+        # shellcheck source=/dev/null
+        source "$state"
+        box="${BOX_NAME}"; wt="${WORKTREE}"
+        ip="-"
+        [[ -f "${BOX_STATE_DIR}/${box}/state" ]] \
+            && ip=$(awk -F= '/^BOX_IP=/{print $2}' "${BOX_STATE_DIR}/${box}/state")
+        local sess="-"
+        tm has-session -t "=${box}${ISO_SUFFIX}" 2>/dev/null && sess="up"
+        printf '%-40s %-15s %-8s %s\n' "$box" "$ip" "$sess" "$wt"
+    done
+}
+
+cmd_url() {
+    local dir="${1:-$PWD}" box
+    dir=$(realpath "$dir")
+    box=$(box_name_for "$dir")
+    print_url "$box" "$dir"
+}
+
+case "${1:-}" in
+    up)          shift; cmd_up "$@" ;;
+    down)        shift; cmd_down "$@" ;;
+    list|ls)     cmd_list ;;
+    url)         shift; cmd_url "$@" ;;
+    -h|--help|"") usage ;;
+    *)           die "unknown command '$1' (try: up, down, list, url)" ;;
+esac

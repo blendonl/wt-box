@@ -42,13 +42,14 @@ SCRIPT_PATH="$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo
 # they are in a session.  Must stay above everything else: it runs as root.
 
 if [[ "${1:-}" == "--exec-shell" ]]; then
-    _env=(HOME=/home/notpc "PATH=${PATH}")
+    _user="${SUDO_USER:-$(id -un)}"
+    _env=("HOME=$(getent passwd "${_user}" | cut -d: -f6)" "PATH=${PATH}")
     [[ -n "${2:-}" ]] && _env+=("TMUX=$2")
     [[ -n "${3:-}" ]] && _env+=("TMUX_PANE=$3")
     for _v in TERM COLORTERM XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS; do
         [[ -n "${!_v:-}" ]] && _env+=("${_v}=${!_v}")
     done
-    exec sudo -u notpc env "${_env[@]}" /usr/bin/zsh -l
+    exec sudo -u "${_user}" env "${_env[@]}" /usr/bin/zsh -l
 fi
 
 # ── Container detection ────────────────────────────────────────────────────
@@ -72,8 +73,8 @@ fi
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
-ENSURE_BOX="/home/notpc/bin/ensure-box"
-VNC_PW_CMD="/home/notpc/bin/box-vnc-pw"
+ENSURE_BOX="$(dirname "${SCRIPT_PATH}")/ensure-box"
+VNC_PW_CMD="$(dirname "${SCRIPT_PATH}")/box-vnc-pw"
 PROJECT_ROOTS=("/mnt/data/personal" "/mnt/data/work" "$HOME/projects")
 # How deep below a project root a repo may sit.  A directory at this depth is
 # still checked for .git, so this matches the old `find -maxdepth 5`.

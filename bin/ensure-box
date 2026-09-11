@@ -47,8 +47,12 @@ BOX_IP=""
 USE_TMUX=true
 WORK_DIR=""
 TMUX_SOCKET_DIR="/tmp/tmux-ensure-box"
-TMUX_CONF="/home/notpc/.config/tmux/tmux.conf"
-VNC_PW_CMD="/home/notpc/bin/box-vnc-pw"
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+BOX_USER="${SUDO_USER:-$(id -un)}"
+BOX_GROUP="$(id -gn "${BOX_USER}")"
+BOX_HOME="$(getent passwd "${BOX_USER}" | cut -d: -f6)"
+TMUX_CONF="${BOX_HOME}/.config/tmux/tmux.conf"
+VNC_PW_CMD="${SCRIPT_DIR}/box-vnc-pw"
 ACTION=""
 SHELL_CMD=""
 BROWSER=false
@@ -64,7 +68,7 @@ _DBUS_ENV=""
 _build_dbus_env() {
     [[ -n "${_DBUS_ENV}" ]] && return
     local uid
-    uid=$(id -u notpc 2>/dev/null || echo 1000)
+    uid=$(id -u "${BOX_USER}" 2>/dev/null || echo 1000)
     local runtime="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
     local dbus="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${runtime}/bus}"
     _DBUS_ENV="XDG_RUNTIME_DIR=${runtime} DBUS_SESSION_BUS_ADDRESS=${dbus}"
@@ -293,15 +297,15 @@ box_exists()      { [[ -f "$(box_state_file)" ]]; }
 _resolve_work_dir() {
     [[ -n "${WORK_DIR}" ]] && return 0        # --dir takes precedence
     local shared_git main_wt
-    if shared_git=$(sudo -u notpc git rev-parse --git-common-dir 2>/dev/null); then
-        main_wt=$(sudo -u notpc git --git-dir="$shared_git" worktree list --porcelain 2>/dev/null \
+    if shared_git=$(sudo -u "${BOX_USER}" git rev-parse --git-common-dir 2>/dev/null); then
+        main_wt=$(sudo -u "${BOX_USER}" git --git-dir="$shared_git" worktree list --porcelain 2>/dev/null \
             | awk '/^worktree /{wt=$2} /^branch refs\/heads\/(main|master)$/{print wt; exit}')
         if [[ -n "$main_wt" && -d "$main_wt" ]]; then
             WORK_DIR="$main_wt"
             return 0
         fi
     fi
-    WORK_DIR="/home/notpc"   # fallback
+    WORK_DIR="${BOX_HOME}"   # fallback
 }
 
 mark_box_created() {
@@ -411,7 +415,7 @@ _user_shell_cmd() {
     local c=""
     [[ -n "${BOX_NAME}" ]] && c+="$(_box_path_prepend "${BOX_NAME}")"
     [[ -n "${WORK_DIR}" ]] && c+="cd '${WORK_DIR}' 2>/dev/null || true; "
-    c+="sudo -u notpc env ${_DBUS_ENV} /usr/bin/zsh -l"
+    c+="sudo -u ${BOX_USER} env ${_DBUS_ENV} /usr/bin/zsh -l"
     echo "${c}"
 }
 
@@ -419,22 +423,22 @@ _ensure_tmux_server() {
     local box_name="$1" tmux_socket="$2" user_shell="$3"
 
     # If an old root-owned socket exists, kill it so we can migrate to notpc.
-    if [[ -S "${tmux_socket}" ]] && [[ "$(stat -c '%U' "${tmux_socket}" 2>/dev/null)" != "notpc" ]]; then
-        echo "  tmux: migrating root-owned session to notpc …" >&2
-        HOME=/home/notpc tmux -f "${TMUX_CONF}" -S "${tmux_socket}" kill-server 2>/dev/null || true
+    if [[ -S "${tmux_socket}" ]] && [[ "$(stat -c '%U' "${tmux_socket}" 2>/dev/null)" != "${BOX_USER}" ]]; then
+        echo "  tmux: migrating root-owned session to ${BOX_USER} …" >&2
+        HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" kill-server 2>/dev/null || true
         sleep 0.3
     fi
 
-    if HOME=/home/notpc tmux -f "${TMUX_CONF}" -S "${tmux_socket}" has-session -t "${box_name}" 2>/dev/null; then
+    if HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" has-session -t "${box_name}" 2>/dev/null; then
         echo "  tmux: session already running" >&2
         return 0
     fi
 
     echo "  tmux: starting inside netns …" >&2
     mkdir -p "$(dirname "${tmux_socket}")"
-    chown notpc:notpc "$(dirname "${tmux_socket}")" 2>/dev/null || true
+    chown "${BOX_USER}:${BOX_GROUP}" "$(dirname "${tmux_socket}")" 2>/dev/null || true
 
-    local default_path="${WORK_DIR:-/home/notpc}"
+    local default_path="${WORK_DIR:-${BOX_HOME}}"
 
     # Set hostname before tmux starts (needs root).
     ip netns exec "${box_name}" hostname "${box_name}" 2>/dev/null || true
@@ -444,22 +448,22 @@ _ensure_tmux_server() {
     local wrap_bin
     wrap_bin="$(_docker_wrapper_dir "${box_name}")"
     ip netns exec "${box_name}" \
-        env HOME=/home/notpc \
-        sudo -u notpc env ${_DBUS_ENV} "PATH=${wrap_bin}:$PATH" \
+        env HOME="${BOX_HOME}" \
+        sudo -u "${BOX_USER}" env ${_DBUS_ENV} "PATH=${wrap_bin}:$PATH" \
         tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
             new-session -d -c "${default_path}" -s "${box_name}" \
             /usr/bin/env ${_DBUS_ENV} "PATH=${wrap_bin}:$PATH" /usr/bin/zsh -l \
         || die "tmux new-session -d failed inside netns ${box_name}"
 
     # default-command for new windows (server runs as notpc, no sudo needed).
-    HOME=/home/notpc sudo -u notpc tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
+    HOME="${BOX_HOME}" sudo -u "${BOX_USER}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
         set-option -t "${box_name}" default-command \
         "cd '${default_path}' 2>/dev/null || true; exec env ${_DBUS_ENV} PATH='${wrap_bin}':\$PATH /usr/bin/zsh -l" \
         2>/dev/null || true
 
     # Give the session a moment to settle.
     local i=0
-    while ! HOME=/home/notpc tmux -f "${TMUX_CONF}" -S "${tmux_socket}" has-session -t "${box_name}" 2>/dev/null; do
+    while ! HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" has-session -t "${box_name}" 2>/dev/null; do
         sleep 0.1; ((i++))
         [[ $i -le 30 ]] || die "tmux server failed to start for '${box_name}'"
     done
@@ -518,9 +522,9 @@ enter_box() {
 
         # Refresh default-command so new windows open in the right dir
         # and still pick up the docker→podman wrapper.
-        local default_path="${WORK_DIR:-/home/notpc}" wrap_bin
+        local default_path="${WORK_DIR:-${BOX_HOME}}" wrap_bin
         wrap_bin="$(_docker_wrapper_dir "${box_name}")"
-        HOME=/home/notpc sudo -u notpc tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
+        HOME="${BOX_HOME}" sudo -u "${BOX_USER}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
             set-option -t "${box_name}" default-command \
             "cd '${default_path}' 2>/dev/null || true; exec env ${_DBUS_ENV} PATH='${wrap_bin}':\$PATH /usr/bin/zsh -l" \
             2>/dev/null || true
@@ -531,7 +535,7 @@ enter_box() {
         fi
 
         echo "  tmux: attaching  (Ctrl-B d to detach)" >&2
-        export HOME=/home/notpc
+        export HOME="${BOX_HOME}"
         exec tmux -f "${TMUX_CONF}" -S "${tmux_socket}" attach-session -d -t "${box_name}"
     fi
 
@@ -558,20 +562,20 @@ _ensure_tmux_server_host() {
     local box_name="$1" tmux_socket="$2" user_shell="$3"
 
     # If an old root-owned socket exists, kill it so we can migrate to notpc.
-    if [[ -S "${tmux_socket}" ]] && [[ "$(stat -c '%U' "${tmux_socket}" 2>/dev/null)" != "notpc" ]]; then
-        echo "  tmux: migrating root-owned session to notpc …" >&2
-        HOME=/home/notpc tmux -f "${TMUX_CONF}" -S "${tmux_socket}" kill-server 2>/dev/null || true
+    if [[ -S "${tmux_socket}" ]] && [[ "$(stat -c '%U' "${tmux_socket}" 2>/dev/null)" != "${BOX_USER}" ]]; then
+        echo "  tmux: migrating root-owned session to ${BOX_USER} …" >&2
+        HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" kill-server 2>/dev/null || true
         sleep 0.3
     fi
 
-    if HOME=/home/notpc tmux -f "${TMUX_CONF}" -S "${tmux_socket}" has-session -t "${box_name}" 2>/dev/null; then
+    if HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" has-session -t "${box_name}" 2>/dev/null; then
         return 0
     fi
 
     mkdir -p "$(dirname "${tmux_socket}")"
-    chown notpc:notpc "$(dirname "${tmux_socket}")" 2>/dev/null || true
+    chown "${BOX_USER}:${BOX_GROUP}" "$(dirname "${tmux_socket}")" 2>/dev/null || true
 
-    local default_path="${WORK_DIR:-/home/notpc}"
+    local default_path="${WORK_DIR:-${BOX_HOME}}"
 
     # Set hostname before tmux starts (needs root).
     hostname "${box_name}" 2>/dev/null || true
@@ -580,20 +584,20 @@ _ensure_tmux_server_host() {
     # Prepend the docker→podman wrapper bin.
     local wrap_bin
     wrap_bin="$(_docker_wrapper_dir "${box_name}")"
-    HOME=/home/notpc sudo -u notpc env ${_DBUS_ENV} "PATH=${wrap_bin}:$PATH" \
+    HOME="${BOX_HOME}" sudo -u "${BOX_USER}" env ${_DBUS_ENV} "PATH=${wrap_bin}:$PATH" \
         tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
         new-session -d -c "${default_path}" -s "${box_name}" \
         /usr/bin/env ${_DBUS_ENV} "PATH=${wrap_bin}:$PATH" /usr/bin/zsh -l \
         || die "tmux new-session -d failed for ${box_name}"
 
     # default-command for new windows.
-    HOME=/home/notpc sudo -u notpc tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
+    HOME="${BOX_HOME}" sudo -u "${BOX_USER}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
         set-option -t "${box_name}" default-command \
         "cd '${default_path}' 2>/dev/null || true; exec env ${_DBUS_ENV} PATH='${wrap_bin}':\$PATH /usr/bin/zsh -l" \
         2>/dev/null || true
 
     local i=0
-    while ! HOME=/home/notpc tmux -f "${TMUX_CONF}" -S "${tmux_socket}" has-session -t "${box_name}" 2>/dev/null; do
+    while ! HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" has-session -t "${box_name}" 2>/dev/null; do
         sleep 0.1; ((i++))
         [[ $i -le 30 ]] || die "tmux server failed to start for '${box_name}'"
     done
@@ -633,7 +637,7 @@ enter_box_host() {
         fi
 
         echo "  tmux: attaching  (Ctrl-B d to detach)" >&2
-        export HOME=/home/notpc
+        export HOME="${BOX_HOME}"
         exec tmux -f "${TMUX_CONF}" -S "${tmux_socket}" attach-session -d -t "${box_name}"
     fi
 
@@ -709,7 +713,7 @@ cmd_list() {
         [[ -f "/var/run/netns/${BOX_NAME}" ]] && ns_state="up"
 
         local sock="${TMUX_SOCKET_DIR}/${BOX_NAME}/tmux.sock"
-        HOME=/home/notpc tmux -f "${TMUX_CONF}" -S "${sock}" has-session -t "${BOX_NAME}" 2>/dev/null && tmux_state="live"
+        HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${sock}" has-session -t "${BOX_NAME}" 2>/dev/null && tmux_state="live"
 
         podman container inspect "${BOX_NAME}-browser" --format '{{.State.Running}}' 2>/dev/null \
             | grep -q "true" && browser_state="running"
@@ -732,9 +736,9 @@ cmd_status() {
     fi
 
     local sock="${TMUX_SOCKET_DIR}/${name}/tmux.sock"
-    if HOME=/home/notpc tmux -f "${TMUX_CONF}" -S "${sock}" has-session -t "${name}" 2>/dev/null; then
+    if HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${sock}" has-session -t "${name}" 2>/dev/null; then
         local wins
-        wins=$(HOME=/home/notpc tmux -f "${TMUX_CONF}" -S "${sock}" list-windows -t "${name}" 2>/dev/null | wc -l)
+        wins=$(HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${sock}" list-windows -t "${name}" 2>/dev/null | wc -l)
         echo "  Tmux: live (${wins} window(s), socket: ${sock})" >&2
     else
         echo "  Tmux: not running" >&2
@@ -767,7 +771,7 @@ cmd_stop() {
     local sock="${TMUX_SOCKET_DIR}/${name}/tmux.sock"
     if [[ -S "${sock}" ]]; then
         echo "  Killing tmux server …" >&2
-        HOME=/home/notpc tmux -f "${TMUX_CONF}" -S "${sock}" kill-server 2>/dev/null || true
+        HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${sock}" kill-server 2>/dev/null || true
         sleep 0.5
     fi
     rm -rf "${TMUX_SOCKET_DIR:?}/${name}"

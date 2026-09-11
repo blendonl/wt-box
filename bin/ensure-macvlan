@@ -174,7 +174,7 @@ cat <<EOF
 │     socket without sudo:                                             │
 │                                                                      │
 │       sudo groupadd -r podman                                        │
-│       sudo usermod -aG podman notpc                                  │
+│       sudo usermod -aG podman ${SUDO_USER:-\$USER}                                  │
 │                                                                      │
 │  2. Allow the podman group to access the system socket:              │
 │                                                                      │

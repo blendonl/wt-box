@@ -17,7 +17,8 @@ set -euo pipefail
 HOSTS_DIR="/etc/wt-boxes.d"
 DNSMASQ_DROPIN="/etc/dnsmasq.d/wt-boxes.conf"
 RESOLVED_DROPIN="/etc/systemd/resolved.conf.d/wt-boxes.conf"
-BOX_USER="notpc"
+BOX_USER="${SUDO_USER:-$(id -un)}"
+BOX_GROUP="$(id -gn "${BOX_USER}")"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -33,9 +34,9 @@ fi
 mkdir -p /etc/dnsmasq.d "${HOSTS_DIR}"
 # wt-box runs as the unprivileged user and rewrites the hostsdir file, so
 # hand the directory to it.  dnsmasq only needs to read (755/644).
-chown "${BOX_USER}:${BOX_USER}" "${HOSTS_DIR}"
+chown "${BOX_USER}:${BOX_GROUP}" "${HOSTS_DIR}"
 chmod 755 "${HOSTS_DIR}"
-[[ -f "${HOSTS_DIR}/wt-boxes.hosts" ]] || install -m 644 -o "${BOX_USER}" -g "${BOX_USER}" /dev/null "${HOSTS_DIR}/wt-boxes.hosts"
+[[ -f "${HOSTS_DIR}/wt-boxes.hosts" ]] || install -m 644 -o "${BOX_USER}" -g "${BOX_GROUP}" /dev/null "${HOSTS_DIR}/wt-boxes.hosts"
 
 cat > "${DNSMASQ_DROPIN}" <<'EOF'
 # wt-box: serve *.wt.test worktree names from /etc/wt-boxes.d/

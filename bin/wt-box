@@ -20,8 +20,9 @@
 
 set -euo pipefail
 
-ENSURE_BOX="/home/notpc/bin/ensure-box"
-BOX_LITE="/home/notpc/bin/box-lite"
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+ENSURE_BOX="${SCRIPT_DIR}/ensure-box"
+BOX_LITE="${SCRIPT_DIR}/box-lite"
 MACVLAN_CONF="/etc/podman/ensure-compose.conf"
 BOX_STATE_DIR="/tmp/ensure-box"
 STATE_DIR="/tmp/wt-box"

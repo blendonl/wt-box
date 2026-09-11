@@ -65,7 +65,7 @@ fi
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
-BOX_LITE="/home/notpc/bin/box-lite"
+BOX_LITE="$(dirname "${SCRIPT_PATH}")/box-lite"
 IP_STATE_FILE="/tmp/compose/ip-allocations.txt"
 NETNS_DIR="/var/run/netns"
 ISO_SUFFIX="@net"

@@ -11,8 +11,9 @@
 
 set -euo pipefail
 
-BOX_USER="notpc"
-PW_FILE="${BOX_VNC_PW_FILE:-/home/${BOX_USER}/.ensure-box/vnc-pw}"
+BOX_USER="${SUDO_USER:-$(id -un)}"
+BOX_HOME="$(getent passwd "${BOX_USER}" | cut -d: -f6)"
+PW_FILE="${BOX_VNC_PW_FILE:-${BOX_HOME}/.ensure-box/vnc-pw}"
 PW_LEN=16
 
 if [[ -n "${BOX_VNC_PW:-}" ]]; then
@@ -34,7 +35,7 @@ if [[ ! -s "${PW_FILE}" ]]; then
     # ensure-box runs under sudo, so the file may land root-owned — hand it to
     # the user, otherwise the unprivileged scripts cannot read it back.
     if [[ "$(id -u)" -eq 0 ]]; then
-        chown "${BOX_USER}:${BOX_USER}" "${PW_DIR}" "${PW_FILE}" 2>/dev/null || true
+        chown "${BOX_USER}:$(id -gn "${BOX_USER}")" "${PW_DIR}" "${PW_FILE}" 2>/dev/null || true
     fi
 fi
 

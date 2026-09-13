@@ -1,0 +1,880 @@
+#!/usr/bin/env bash
+# ensure-box — Isolated dev environment using network namespaces + macvlan.
+#
+# Usage: ensure-box [flags] <box_name>
+#
+# Each box gets its own LAN IP via macvlan.  All processes inside the box
+# share the host's filesystem, packages, and OS — only the network (and
+# optionally the PID space) is isolated.  No container daemon, no images.
+#
+# Flags:
+#   --pid              Enable PID-namespace isolation (private /proc)
+#   --no-tmux          Skip tmux — drop into a plain shell (default: tmux)
+#   --no-enter         Create/ensure the box + tmux server but don't attach
+#   --dir PATH         Start shell in PATH instead of $HOME
+#   --browser          Launch a browser container in the box's network ns
+#   --browser-port N   VNC port for the browser (default: 6901)
+#   -c, --command CMD  Run CMD inside the box instead of an interactive shell
+#
+# Subcommands:
+#   ensure-box list              List all boxes
+#   ensure-box status <name>     Show box status
+#   ensure-box stop  [--rm] <name>  Stop a box (--rm also releases IP)
+#
+# Two modes (auto-detected):
+#   MACVLAN MODE  — when /etc/podman/ensure-compose.conf exists.
+#                   Each box gets its own LAN IP.  No port conflicts.
+#   HOST MODE     — fallback.  Isolated PID/mount/UTS namespaces only.
+#                   Ports are shared with the host; conflicts are possible.
+
+set -euo pipefail
+
+# ── Globals ───────────────────────────────────────────────────────────────
+
+CONFIG_FILE="/etc/podman/ensure-compose.conf"
+IP_STATE_FILE="/tmp/compose/ip-allocations.txt"
+BOX_STATE_DIR="/tmp/ensure-box"
+USE_MACVLAN=false
+# Config values (loaded from CONFIG_FILE).
+MACVLAN_PARENT=""     # Physical iface, e.g. enp1s0.
+MACVLAN_SUBNET=""     # e.g. 192.168.0.0/24.
+MACVLAN_GATEWAY=""    # e.g. 192.168.0.1.
+MACVLAN_DNS=""        # e.g. 1.1.1.1.
+MACVLAN_IP_POOL_START=""
+MACVLAN_IP_POOL_END=""
+BOX_NAME=""
+BOX_IP=""
+USE_TMUX=true
+WORK_DIR=""
+TMUX_SOCKET_DIR="/tmp/tmux-ensure-box"
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+BOX_USER="${SUDO_USER:-$(id -un)}"
+BOX_GROUP="$(id -gn "${BOX_USER}")"
+BOX_HOME="$(getent passwd "${BOX_USER}" | cut -d: -f6)"
+TMUX_CONF="${BOX_HOME}/.config/tmux/tmux.conf"
+VNC_PW_CMD="${SCRIPT_DIR}/box-vnc-pw"
+ACTION=""
+SHELL_CMD=""
+BROWSER=false
+BROWSER_PORT=6901
+USE_PID_NS=false
+NO_ENTER=false
+
+# ── D-Bus session environment ──────────────────────────────────────────────
+# The box shares the host filesystem, so D-Bus sockets under /run/user/<UID>
+# are reachable.  Propagate these vars so systemctl --user (and other D-Bus
+# clients) work inside the box.
+_DBUS_ENV=""
+_build_dbus_env() {
+    [[ -n "${_DBUS_ENV}" ]] && return
+    local uid
+    uid=$(id -u "${BOX_USER}" 2>/dev/null || echo 1000)
+    local runtime="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
+    local dbus="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${runtime}/bus}"
+    _DBUS_ENV="XDG_RUNTIME_DIR=${runtime} DBUS_SESSION_BUS_ADDRESS=${dbus}"
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# //'; exit 0; }
+
+# ── Config loading ────────────────────────────────────────────────────────
+
+load_config() {
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        # shellcheck source=/dev/null
+        source "${CONFIG_FILE}"
+        local _vars=(MACVLAN_PARENT MACVLAN_SUBNET MACVLAN_GATEWAY MACVLAN_DNS
+                      MACVLAN_IP_POOL_START MACVLAN_IP_POOL_END)
+        for _var in "${_vars[@]}"; do
+            [[ -n "${!_var:-}" ]] || die "${CONFIG_FILE} is missing '${_var}'. Re-run 'sudo ensure-macvlan'."
+        done
+        USE_MACVLAN=true
+    fi
+}
+
+# ── IP allocation (shared pool with ensure-compose) ───────────────────────
+
+allocate_ip() {
+    local box_name="$1"
+    local pool_start="${MACVLAN_IP_POOL_START:-192.168.0.200}"
+    local pool_end="${MACVLAN_IP_POOL_END:-192.168.0.239}"
+    local base="${pool_start%.*}"
+    local start_oct="${pool_start##*.}"
+    local end_oct="${pool_end##*.}"
+
+    mkdir -p "$(dirname "${IP_STATE_FILE}")"
+    touch "${IP_STATE_FILE}" 2>/dev/null || die "cannot write to ${IP_STATE_FILE}"
+
+    local existing
+    existing=$(grep "^${box_name} " "${IP_STATE_FILE}" 2>/dev/null || true)
+    if [[ -n "${existing}" ]]; then
+        echo "${existing}" | cut -d' ' -f2
+        return 0
+    fi
+
+    declare -A taken_octets
+    while IFS=' ' read -r _ ip; do
+        [[ -n "${ip}" ]] && taken_octets["${ip##*.}"]=1
+    done < "${IP_STATE_FILE}"
+
+    for ((i = start_oct; i <= end_oct; i++)); do
+        if [[ -z "${taken_octets[$i]:-}" ]]; then
+            local dev_ip="${base}.${i}"
+            echo "${box_name} ${dev_ip}" >> "${IP_STATE_FILE}"
+            echo "${dev_ip}"
+            return 0
+        fi
+    done
+    die "No free IP in pool ${pool_start}–${pool_end}."
+}
+
+free_ip() {
+    local box_name="$1"
+    [[ -f "${IP_STATE_FILE}" ]] || return 0
+    # grep exits 1 when every line was filtered out (empty result) — that is
+    # a success here, not an error.
+    grep -v "^${box_name} " "${IP_STATE_FILE}" > "${IP_STATE_FILE}.tmp" || true
+    mv "${IP_STATE_FILE}.tmp" "${IP_STATE_FILE}"
+}
+
+# ── Network namespace management ──────────────────────────────────────────
+
+# Inside a box the hostname is the box name (see the UTS namespace dance in
+# enter_box), but nothing resolves that name: nsswitch here is
+# "hosts: files resolve dns" with no myhostname module, and /etc/hosts only
+# knows the real host.  Every sudo inside the box then prints
+#   sudo: unable to resolve host <box>: Name or service not known
+# So give the box its own /etc/hosts.  'ip netns exec' bind-mounts everything
+# in /etc/netns/<box>/ over its /etc counterpart inside a private mount
+# namespace, exactly as it already does for resolv.conf — the host's own
+# /etc/hosts is untouched.
+_write_netns_hosts() {
+    local box_name="$1"
+    local dir="/etc/netns/${box_name}"
+    mkdir -p "${dir}"
+    {
+        # Keep the host's entries (localhost, the IPv6 names) so the box only
+        # gains a name; drop any pre-existing line for this box so a second
+        # run cannot leave a stale address ahead of ours.
+        grep -vE "[[:space:]]${box_name}([[:space:]]|\$)" /etc/hosts 2>/dev/null || true
+        printf '127.0.0.1\t%s\n' "${box_name}"
+    } > "${dir}/hosts"
+}
+
+create_netns() {
+    local box_name="$1" dev_ip="$2"
+
+    echo "→ Creating network namespace '${box_name}' …" >&2
+
+    # 1. Create netns.
+    if [[ -f "/var/run/netns/${box_name}" ]]; then
+        echo "   netns already exists" >&2
+    else
+        echo "   + ip netns add ${box_name}" >&2
+        ip netns add "${box_name}" || die "ip netns add ${box_name} failed"
+    fi
+
+    # 2. Loopback up.
+    echo "   + lo up" >&2
+    ip netns exec "${box_name}" ip link set lo up || die "lo up failed"
+
+    # 3. Network config from the ensure-compose.conf.
+    #    MACVLAN_PARENT is the physical NIC (enp1s0); MACVLAN_SUBNET gives
+    #    us the prefix length; MACVLAN_GATEWAY is the default route.
+    local parent_if="${MACVLAN_PARENT}"
+    local prefix_len="${MACVLAN_SUBNET##*/}"
+    prefix_len="${prefix_len:-24}"
+    local gateway="${MACVLAN_GATEWAY}"
+    echo "   parent=${parent_if} prefix=${prefix_len} gateway=${gateway}" >&2
+
+    # 4. Create macvlan on the physical parent.
+    #    Use the IP's last octet for a short unique iface name (Linux caps
+    #    interface names at 15 chars).
+    local last_oct="${dev_ip##*.}"
+    local mv_if="mv-${last_oct}"
+    echo "   + macvlan iface: ${mv_if}" >&2
+
+    if ip netns exec "${box_name}" ip link show "${mv_if}" &>/dev/null 2>&1; then
+        echo "   macvlan ${mv_if} already in namespace" >&2
+    else
+        ip link delete "${mv_if}" 2>/dev/null || true
+        echo "   + ip link add link ${parent_if} name ${mv_if} type macvlan mode bridge" >&2
+        ip link add link "${parent_if}" name "${mv_if}" type macvlan mode bridge \
+            || die "failed to create macvlan ${mv_if} on ${parent_if}"
+        # Stable, locally-administered MAC derived from the box IP.  With the
+        # default random MAC, every box recreation changes it and hosts keep
+        # talking to the stale neighbour entry until their ARP cache expires.
+        # Retry: a just-deleted iface can hold its MAC for a moment, and the
+        # parent rejects a duplicate with "Address already in use".
+        local b1 b2 b3 b4 mac i
+        IFS='.' read -r b1 b2 b3 b4 <<< "${dev_ip}"
+        mac=$(printf '02:00:%02x:%02x:%02x:%02x' "$b1" "$b2" "$b3" "$b4")
+        for ((i = 0; i < 5; i++)); do
+            if ((i == 4)); then
+                ip link set dev "${mv_if}" address "${mac}" && break
+            else
+                ip link set dev "${mv_if}" address "${mac}" 2>/dev/null && break
+            fi
+            sleep 0.5
+        done
+        [[ "$(cat "/sys/class/net/${mv_if}/address")" == "${mac}" ]] \
+            || die "failed to set stable MAC on ${mv_if}"
+        echo "   + ip link set ${mv_if} netns ${box_name}" >&2
+        ip link set "${mv_if}" netns "${box_name}" \
+            || die "failed to move ${mv_if} into netns ${box_name}"
+    fi
+
+    # 5. Configure IP and bring up.
+    echo "   + ip addr add ${dev_ip}/${prefix_len} dev ${mv_if}" >&2
+    ip netns exec "${box_name}" ip addr add "${dev_ip}/${prefix_len}" dev "${mv_if}" \
+        || die "ip addr add ${dev_ip}/${prefix_len} failed on ${mv_if}"
+    echo "   + ip link set ${mv_if} up" >&2
+    ip netns exec "${box_name}" ip link set "${mv_if}" up \
+        || die "ip link set ${mv_if} up failed"
+    echo "   + ip route replace default via ${gateway}" >&2
+    ip netns exec "${box_name}" ip route replace default via "${gateway}" 2>/dev/null || true
+
+    # 6. DNS + hostname resolution (ip-netns auto-bind-mounts the files in
+    #    /etc/netns/<name>/ over /etc/).
+    mkdir -p "/etc/netns/${box_name}"
+    echo "nameserver ${MACVLAN_DNS}" > "/etc/netns/${box_name}/resolv.conf"
+    _write_netns_hosts "${box_name}"
+
+    echo "   ✓ IP: ${dev_ip}/${prefix_len}  GW: ${gateway}  DNS: ${MACVLAN_DNS}" >&2
+
+    # 7. Host route: the host's subnet route points at the physical NIC,
+    #    but macvlan children are unreachable through their parent from the
+    #    host — traffic to box IPs must leave via the mac-host interface.
+    #    A per-box /32 beats the subnet route (longest prefix match) without
+    #    affecting any other LAN host.
+    if ip link show mac-host &>/dev/null; then
+        echo "   + host route: ${dev_ip}/32 dev mac-host" >&2
+        ip route replace "${dev_ip}/32" dev mac-host 2>/dev/null || true
+        # Drop any stale neighbour entry — the macvlan MAC may have changed
+        # since this IP was last used, and a dead lladdr blackholes traffic
+        # for the whole ARP expiry window.
+        ip neigh flush "${dev_ip}" 2>/dev/null || true
+    fi
+
+    # 8. Docker→podman wrapper so containers use the box's IP.
+    _write_docker_wrapper "${box_name}"
+}
+
+destroy_netns() {
+    local box_name="$1"
+    echo "→ Destroying network namespace '${box_name}' …" >&2
+    if [[ -f "/var/run/netns/${box_name}" ]]; then
+        # Kill everything still running inside first — orphaned processes
+        # keep the (then anonymous) netns and its macvlan MAC alive, which
+        # blocks recreating the box ("Address already in use").
+        local pid
+        for pid in $(ip netns pids "${box_name}" 2>/dev/null); do
+            kill "${pid}" 2>/dev/null || true
+        done
+        sleep 0.3
+        ip netns delete "${box_name}" 2>/dev/null || true
+    fi
+    # Drop the host-side /32 route (see create_netns step 7).
+    local bip=""
+    [[ -f "${BOX_STATE_DIR}/${box_name}/state" ]] \
+        && bip=$(awk -F= '/^BOX_IP=/{print $2}' "${BOX_STATE_DIR}/${box_name}/state")
+    [[ "${bip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        && ip route del "${bip}/32" dev mac-host 2>/dev/null || true
+    rm -rf "/etc/netns/${box_name}"
+    rm -rf "$(_docker_wrapper_dir "${box_name}")"
+}
+
+# ── Box state ─────────────────────────────────────────────────────────────
+
+box_state_file()  { echo "${BOX_STATE_DIR}/${BOX_NAME}/state"; }
+box_socket_dir()  { echo "${TMUX_SOCKET_DIR}/${BOX_NAME}"; }
+box_tmux_socket() { echo "$(box_socket_dir)/tmux.sock"; }
+box_exists()      { [[ -f "$(box_state_file)" ]]; }
+
+# When --dir is not given, detect the git main worktree so the box always
+# starts in the primary worktree, not in a stale .claude/worktrees/ dir.
+_resolve_work_dir() {
+    [[ -n "${WORK_DIR}" ]] && return 0        # --dir takes precedence
+    local shared_git main_wt
+    if shared_git=$(sudo -u "${BOX_USER}" git rev-parse --git-common-dir 2>/dev/null); then
+        main_wt=$(sudo -u "${BOX_USER}" git --git-dir="$shared_git" worktree list --porcelain 2>/dev/null \
+            | awk '/^worktree /{wt=$2} /^branch refs\/heads\/(main|master)$/{print wt; exit}')
+        if [[ -n "$main_wt" && -d "$main_wt" ]]; then
+            WORK_DIR="$main_wt"
+            return 0
+        fi
+    fi
+    WORK_DIR="${BOX_HOME}"   # fallback
+}
+
+mark_box_created() {
+    mkdir -p "$(dirname "$(box_state_file)")"
+    cat > "$(box_state_file)" <<EOF
+BOX_NAME=${BOX_NAME}
+BOX_IP=${BOX_IP}
+CREATED_AT=$(date -Iseconds)
+USE_PID_NS=${USE_PID_NS}
+EOF
+}
+
+read_box_state() {
+    # shellcheck source=/dev/null
+    source "$(box_state_file)"
+}
+
+# ── Docker→podman wrapper ──────────────────────────────────────────────────
+# Docker daemon runs in the host's root network namespace, so 'docker run'
+# and 'docker compose' inside a box use the host's IP even though the shell
+# is in the box's netns.  Podman supports --network ns:/path, so we install a
+# wrapper script at <box>/bin/docker that redirects run/create/compose to
+# podman with the box's netns.
+
+_docker_wrapper_dir()  { echo "${BOX_STATE_DIR}/${1:-${BOX_NAME}}/bin"; }
+
+_write_docker_wrapper() {
+    local box_name="$1"
+    local dir bin
+    dir="$(_docker_wrapper_dir "${box_name}")"
+    bin="${dir}/docker"
+    mkdir -p "${dir}"
+
+    if [[ "${USE_MACVLAN}" == "true" ]]; then
+        local ns_path="/var/run/netns/${box_name}"
+        cat > "${bin}" <<'EOF'
+#!/usr/bin/env bash
+# ensure-box docker→podman wrapper — containers use the box's IP, not the host's.
+set -euo pipefail
+NS_PATH="__NS_PATH__"
+case "${1:-}" in
+    run|create)
+        echo "[ensure-box] → podman --network ns:${NS_PATH}" >&2
+        exec podman --network "ns:${NS_PATH}" "$@"
+        ;;
+    compose|docker-compose)
+        shift
+        if command -v podman-compose &>/dev/null; then
+            echo "[ensure-box] → podman-compose --podman-args '--network ns:${NS_PATH}'" >&2
+            exec podman-compose --podman-args "--network ns:${NS_PATH}" "$@"
+        elif podman compose version &>/dev/null 2>&1; then
+            echo "[ensure-box] → podman --network ns:${NS_PATH} compose" >&2
+            exec podman --network "ns:${NS_PATH}" compose "$@"
+        else
+            echo "[ensure-box] WARNING: podman/podman-compose not found — falling back to docker (host IP)." >&2
+            exec /usr/bin/docker compose "$@"
+        fi
+        ;;
+    *)
+        exec /usr/bin/docker "$@"
+        ;;
+esac
+EOF
+        sed -i "s|__NS_PATH__|${ns_path}|g" "${bin}"
+    else
+        # Host mode: use --network host (containers share the host stack).
+        cat > "${bin}" <<'EOF'
+#!/usr/bin/env bash
+# ensure-box docker→podman wrapper (host-network mode).
+set -euo pipefail
+case "${1:-}" in
+    run|create)
+        echo "[ensure-box] → podman --network host" >&2
+        exec podman --network host "$@"
+        ;;
+    compose|docker-compose)
+        shift
+        if command -v podman-compose &>/dev/null; then
+            echo "[ensure-box] → podman-compose (host network)" >&2
+            exec podman-compose "$@"
+        elif podman compose version &>/dev/null 2>&1; then
+            echo "[ensure-box] → podman compose (host network)" >&2
+            exec podman compose "$@"
+        else
+            exec /usr/bin/docker compose "$@"
+        fi
+        ;;
+    *)
+        exec /usr/bin/docker "$@"
+        ;;
+esac
+EOF
+    fi
+    chmod +x "${bin}"
+    echo "   + docker→podman wrapper: ${bin}" >&2
+}
+
+# Emit the PATH-prepend snippet so the wrapper is found before system docker.
+_box_path_prepend() {
+    local box_name="${1:-${BOX_NAME}}"
+    echo "export PATH=\"$(_docker_wrapper_dir "${box_name}"):\$PATH\";"
+}
+
+# ── Shell entry ───────────────────────────────────────────────────────────
+
+_user_shell_cmd() {
+    local c=""
+    [[ -n "${BOX_NAME}" ]] && c+="$(_box_path_prepend "${BOX_NAME}")"
+    [[ -n "${WORK_DIR}" ]] && c+="cd '${WORK_DIR}' 2>/dev/null || true; "
+    c+="sudo -u ${BOX_USER} env ${_DBUS_ENV} /usr/bin/zsh -l"
+    echo "${c}"
+}
+
+_ensure_tmux_server() {
+    local box_name="$1" tmux_socket="$2" user_shell="$3"
+
+    # If an old root-owned socket exists, kill it so we can migrate to notpc.
+    if [[ -S "${tmux_socket}" ]] && [[ "$(stat -c '%U' "${tmux_socket}" 2>/dev/null)" != "${BOX_USER}" ]]; then
+        echo "  tmux: migrating root-owned session to ${BOX_USER} …" >&2
+        HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" kill-server 2>/dev/null || true
+        sleep 0.3
+    fi
+
+    if HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" has-session -t "${box_name}" 2>/dev/null; then
+        echo "  tmux: session already running" >&2
+        return 0
+    fi
+
+    echo "  tmux: starting inside netns …" >&2
+    mkdir -p "$(dirname "${tmux_socket}")"
+    chown "${BOX_USER}:${BOX_GROUP}" "$(dirname "${tmux_socket}")" 2>/dev/null || true
+
+    local default_path="${WORK_DIR:-${BOX_HOME}}"
+
+    # Set hostname before tmux starts (needs root).
+    ip netns exec "${box_name}" hostname "${box_name}" 2>/dev/null || true
+
+    # Run the tmux server as notpc so all windows inherit the right user.
+    # Prepend the docker→podman wrapper bin so containers use the box's IP.
+    local wrap_bin
+    wrap_bin="$(_docker_wrapper_dir "${box_name}")"
+    ip netns exec "${box_name}" \
+        env HOME="${BOX_HOME}" \
+        sudo -u "${BOX_USER}" env ${_DBUS_ENV} "PATH=${wrap_bin}:$PATH" \
+        tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
+            new-session -d -c "${default_path}" -s "${box_name}" \
+            /usr/bin/env ${_DBUS_ENV} "PATH=${wrap_bin}:$PATH" /usr/bin/zsh -l \
+        || die "tmux new-session -d failed inside netns ${box_name}"
+
+    # default-command for new windows (server runs as notpc, no sudo needed).
+    HOME="${BOX_HOME}" sudo -u "${BOX_USER}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
+        set-option -t "${box_name}" default-command \
+        "cd '${default_path}' 2>/dev/null || true; exec env ${_DBUS_ENV} PATH='${wrap_bin}':\$PATH /usr/bin/zsh -l" \
+        2>/dev/null || true
+
+    # Give the session a moment to settle.
+    local i=0
+    while ! HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" has-session -t "${box_name}" 2>/dev/null; do
+        sleep 0.1; ((i++))
+        [[ $i -le 30 ]] || die "tmux server failed to start for '${box_name}'"
+    done
+    echo "  tmux: server ready" >&2
+}
+
+enter_box() {
+    local box_name="$1" cmd="${2:-}"
+    local tmux_socket
+    tmux_socket="$(box_tmux_socket)"
+
+    # Check that the netns file exists (more reliable than "ip netns list").
+    [[ -f "/var/run/netns/${box_name}" ]] \
+        || die "network namespace '${box_name}' does not exist."
+
+    # Re-entering an existing box skips create_netns, so refresh the box's
+    # hosts file here too: one small write, and boxes that predate it (or
+    # whose /etc/hosts has changed since) pick it up without a restart.
+    _write_netns_hosts "${box_name}"
+
+    echo "→ Entering box '${box_name}' …" >&2
+    [[ "${USE_MACVLAN}" == "true" ]] && echo "  IP: ${BOX_IP}" >&2
+    [[ "${BROWSER}" == "true" ]] && echo "  Browser VNC: ${BOX_IP}:${BROWSER_PORT}" >&2
+    echo >&2
+
+    local user_shell
+    user_shell=$(_user_shell_cmd)
+
+    # ── One-shot command (no tmux) ───────────────────────────────────
+    if [[ -n "${cmd}" ]]; then
+        local cd_p="" wrap_bin
+        wrap_bin="$(_docker_wrapper_dir "${box_name}")"
+        [[ -n "${WORK_DIR}" ]] && cd_p="cd '${WORK_DIR}' 2>/dev/null || true; "
+        if [[ "${USE_PID_NS}" == "true" ]]; then
+            # nsenter enters the netns directly, so it does not get ip-netns's
+            # /etc/netns bind mounts — do the hosts one by hand.  unshare
+            # --mount already made this namespace private, so it stays here.
+            unshare --pid --fork --mount --uts -- \
+                nsenter --net="/var/run/netns/${box_name}" -- \
+                /bin/sh -c "export ${_DBUS_ENV} PATH='${wrap_bin}':\$PATH; mount -t proc proc /proc 2>/dev/null || true; mount --bind '/etc/netns/${box_name}/hosts' /etc/hosts 2>/dev/null || true; hostname '${box_name}' 2>/dev/null || true; ${cd_p} exec ${cmd}"
+        else
+            # unshare --uts keeps the hostname change inside this command's
+            # namespace.  'ip netns exec' only unshares net (and mount), so
+            # without it 'hostname' would rename the host itself.
+            ip netns exec "${box_name}" \
+                unshare --uts -- \
+                /bin/sh -c "export ${_DBUS_ENV} PATH='${wrap_bin}':\$PATH; hostname '${box_name}' 2>/dev/null || true; ${cd_p} exec ${cmd}"
+        fi
+        return
+    fi
+
+    # ── Tmux mode ────────────────────────────────────────────────────
+    if [[ "${USE_TMUX}" == "true" ]] && command -v tmux >/dev/null 2>&1; then
+        [[ "${USE_PID_NS}" == "true" ]] && echo "  NOTE: --pid incompatible with tmux; PID isolation disabled." >&2
+        _ensure_tmux_server "${box_name}" "${tmux_socket}" "${user_shell}" || exit 1
+
+        # Refresh default-command so new windows open in the right dir
+        # and still pick up the docker→podman wrapper.
+        local default_path="${WORK_DIR:-${BOX_HOME}}" wrap_bin
+        wrap_bin="$(_docker_wrapper_dir "${box_name}")"
+        HOME="${BOX_HOME}" sudo -u "${BOX_USER}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
+            set-option -t "${box_name}" default-command \
+            "cd '${default_path}' 2>/dev/null || true; exec env ${_DBUS_ENV} PATH='${wrap_bin}':\$PATH /usr/bin/zsh -l" \
+            2>/dev/null || true
+
+        if [[ "${NO_ENTER}" == "true" ]]; then
+            echo "  tmux: server ready — not attaching (--no-enter)" >&2
+            return 0
+        fi
+
+        echo "  tmux: attaching  (Ctrl-B d to detach)" >&2
+        export HOME="${BOX_HOME}"
+        exec tmux -f "${TMUX_CONF}" -S "${tmux_socket}" attach-session -d -t "${box_name}"
+    fi
+
+    # ── Plain shell mode ─────────────────────────────────────────────
+    if [[ "${NO_ENTER}" == "true" ]]; then
+        echo "  Box '${box_name}' ready — not entering (--no-enter)" >&2
+        return 0
+    fi
+
+    echo "  Entering plain shell  (Ctrl-D to exit)" >&2
+    if [[ "${USE_PID_NS}" == "true" ]]; then
+        unshare --pid --fork --mount --uts -- \
+            nsenter --net="/var/run/netns/${box_name}" -- \
+            /bin/sh -c "mount -t proc proc /proc 2>/dev/null || true; mount --bind '/etc/netns/${box_name}/hosts' /etc/hosts 2>/dev/null || true; hostname '${box_name}' 2>/dev/null || true; ${user_shell}"
+    else
+        ip netns exec "${box_name}" \
+            /bin/sh -c "hostname '${box_name}' 2>/dev/null || true; ${user_shell}"
+    fi
+}
+
+# ── Host-mode entry ───────────────────────────────────────────────────────
+
+_ensure_tmux_server_host() {
+    local box_name="$1" tmux_socket="$2" user_shell="$3"
+
+    # If an old root-owned socket exists, kill it so we can migrate to notpc.
+    if [[ -S "${tmux_socket}" ]] && [[ "$(stat -c '%U' "${tmux_socket}" 2>/dev/null)" != "${BOX_USER}" ]]; then
+        echo "  tmux: migrating root-owned session to ${BOX_USER} …" >&2
+        HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" kill-server 2>/dev/null || true
+        sleep 0.3
+    fi
+
+    if HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" has-session -t "${box_name}" 2>/dev/null; then
+        return 0
+    fi
+
+    mkdir -p "$(dirname "${tmux_socket}")"
+    chown "${BOX_USER}:${BOX_GROUP}" "$(dirname "${tmux_socket}")" 2>/dev/null || true
+
+    local default_path="${WORK_DIR:-${BOX_HOME}}"
+
+    # Set hostname before tmux starts (needs root).
+    hostname "${box_name}" 2>/dev/null || true
+
+    # Run the tmux server as notpc so all windows inherit the right user.
+    # Prepend the docker→podman wrapper bin.
+    local wrap_bin
+    wrap_bin="$(_docker_wrapper_dir "${box_name}")"
+    HOME="${BOX_HOME}" sudo -u "${BOX_USER}" env ${_DBUS_ENV} "PATH=${wrap_bin}:$PATH" \
+        tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
+        new-session -d -c "${default_path}" -s "${box_name}" \
+        /usr/bin/env ${_DBUS_ENV} "PATH=${wrap_bin}:$PATH" /usr/bin/zsh -l \
+        || die "tmux new-session -d failed for ${box_name}"
+
+    # default-command for new windows.
+    HOME="${BOX_HOME}" sudo -u "${BOX_USER}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" \
+        set-option -t "${box_name}" default-command \
+        "cd '${default_path}' 2>/dev/null || true; exec env ${_DBUS_ENV} PATH='${wrap_bin}':\$PATH /usr/bin/zsh -l" \
+        2>/dev/null || true
+
+    local i=0
+    while ! HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${tmux_socket}" has-session -t "${box_name}" 2>/dev/null; do
+        sleep 0.1; ((i++))
+        [[ $i -le 30 ]] || die "tmux server failed to start for '${box_name}'"
+    done
+}
+
+enter_box_host() {
+    local box_name="$1" cmd="${2:-}"
+    local tmux_socket
+    tmux_socket="$(box_tmux_socket)"
+
+    echo "→ Entering box '${box_name}' (host-network mode) …" >&2
+    echo "  WARNING: No macvlan config — ports are shared with the host." >&2
+    echo >&2
+
+    local user_shell
+    user_shell=$(_user_shell_cmd)
+
+    if [[ -n "${cmd}" ]]; then
+        local cd_p="" wrap_bin
+        wrap_bin="$(_docker_wrapper_dir "${box_name}")"
+        [[ -n "${WORK_DIR}" ]] && cd_p="cd '${WORK_DIR}' 2>/dev/null || true; "
+        if [[ "${USE_PID_NS}" == "true" ]]; then
+            unshare --pid --fork --mount --uts -- \
+                /bin/sh -c "export ${_DBUS_ENV} PATH='${wrap_bin}':\$PATH; mount -t proc proc /proc 2>/dev/null || true; hostname '${box_name}' 2>/dev/null || true; ${cd_p} exec ${cmd}"
+        else
+            /bin/sh -c "export ${_DBUS_ENV} PATH='${wrap_bin}':\$PATH; hostname '${box_name}' 2>/dev/null || true; ${cd_p} exec ${cmd}"
+        fi
+        return
+    fi
+
+    if [[ "${USE_TMUX}" == "true" ]] && command -v tmux >/dev/null 2>&1; then
+        _ensure_tmux_server_host "${box_name}" "${tmux_socket}" "${user_shell}" || exit 1
+
+        if [[ "${NO_ENTER}" == "true" ]]; then
+            echo "  tmux: server ready — not attaching (--no-enter)" >&2
+            return 0
+        fi
+
+        echo "  tmux: attaching  (Ctrl-B d to detach)" >&2
+        export HOME="${BOX_HOME}"
+        exec tmux -f "${TMUX_CONF}" -S "${tmux_socket}" attach-session -d -t "${box_name}"
+    fi
+
+    if [[ "${NO_ENTER}" == "true" ]]; then
+        echo "  Box '${box_name}' ready — not entering (--no-enter)" >&2
+        return 0
+    fi
+
+    echo "  Entering plain shell  (Ctrl-D to exit)" >&2
+    if [[ "${USE_PID_NS}" == "true" ]]; then
+        unshare --pid --fork --mount --uts -- \
+            /bin/sh -c "mount -t proc proc /proc 2>/dev/null || true; hostname '${box_name}' 2>/dev/null || true; ${user_shell}"
+    else
+        /bin/sh -c "hostname '${box_name}' 2>/dev/null || true; ${user_shell}"
+    fi
+}
+
+# ── Browser ────────────────────────────────────────────────────────────────
+
+launch_browser() {
+    local box_name="$1"
+    local port="${2:-6901}"
+    local cname="${box_name}-browser"
+    local vnc_pw
+    vnc_pw="$("${VNC_PW_CMD}")" || die "cannot resolve the VNC password (${VNC_PW_CMD})"
+
+    if podman container inspect "${cname}" &>/dev/null 2>&1; then
+        if [[ "$(podman container inspect "${cname}" --format '{{.State.Running}}' 2>/dev/null)" == "true" ]]; then
+            echo "→ Browser already running for '${box_name}'." >&2
+            echo "  VNC: ${BOX_IP}:${port}  (password: ${vnc_pw})" >&2
+            return 0
+        fi
+        podman rm -f "${cname}" 2>/dev/null || true
+    fi
+
+    echo "→ Launching browser for '${box_name}' …" >&2
+    if [[ "${USE_MACVLAN}" == "true" ]]; then
+        podman run -d --name "${cname}" --network "ns:/var/run/netns/${box_name}" \
+            --shm-size 512m -e "VNC_PW=${vnc_pw}" kasmweb/brave:1.16.0
+    else
+        podman run -d --name "${cname}" --network host --shm-size 512m \
+            -e "VNC_PW=${vnc_pw}" -p "${port}:6901" kasmweb/brave:1.16.0
+    fi
+    echo "  Browser VNC: ${BOX_IP}:${port}  (password: ${vnc_pw})" >&2
+}
+
+stop_browser() {
+    local cname="${1}-browser"
+    if podman container inspect "${cname}" &>/dev/null 2>&1; then
+        echo "→ Stopping browser for '${1}' …" >&2
+        podman stop "${cname}" 2>/dev/null || true
+        podman rm -f "${cname}" 2>/dev/null || true
+    fi
+}
+
+# ── Subcommands ────────────────────────────────────────────────────────────
+
+cmd_list() {
+    printf "%-14s %-16s %-6s %-6s %-7s %s\n" \
+        "BOX" "IP" "TMUX" "PID_NS" "BROWSER" "NETNS"
+    printf "%-14s %-16s %-6s %-6s %-7s %s\n" \
+        "────────────" "────────────────" "──────" "──────" "───────" "─────"
+
+    [[ -d "${BOX_STATE_DIR}" ]] || { echo "(no boxes)"; return; }
+
+    for state_file in "${BOX_STATE_DIR}"/*/state; do
+        [[ -f "${state_file}" ]] || continue
+        local BOX_NAME="" BOX_IP="" USE_PID_NS=""
+        # shellcheck source=/dev/null
+        source "${state_file}"
+
+        local ns_state="down" tmux_state="off" browser_state="none"
+        [[ -f "/var/run/netns/${BOX_NAME}" ]] && ns_state="up"
+
+        local sock="${TMUX_SOCKET_DIR}/${BOX_NAME}/tmux.sock"
+        HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${sock}" has-session -t "${BOX_NAME}" 2>/dev/null && tmux_state="live"
+
+        podman container inspect "${BOX_NAME}-browser" --format '{{.State.Running}}' 2>/dev/null \
+            | grep -q "true" && browser_state="running"
+
+        printf "%-14s %-16s %-6s %-6s %-7s %s\n" \
+            "${BOX_NAME}" "${BOX_IP:-host}" "${tmux_state}" \
+            "${USE_PID_NS:-false}" "${browser_state}" "${ns_state}"
+    done
+}
+
+cmd_status() {
+    local name="$1"
+    if [[ -f "/var/run/netns/${name}" ]]; then
+        echo "Box '${name}' is up." >&2
+        local ip
+        ip=$(grep "^${name} " "${IP_STATE_FILE}" 2>/dev/null | awk '{print $2}' || echo "unknown")
+        echo "  IP: ${ip}" >&2
+    else
+        echo "Box '${name}' is not running (no network namespace)." >&2
+    fi
+
+    local sock="${TMUX_SOCKET_DIR}/${name}/tmux.sock"
+    if HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${sock}" has-session -t "${name}" 2>/dev/null; then
+        local wins
+        wins=$(HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${sock}" list-windows -t "${name}" 2>/dev/null | wc -l)
+        echo "  Tmux: live (${wins} window(s), socket: ${sock})" >&2
+    else
+        echo "  Tmux: not running" >&2
+    fi
+
+    if podman container inspect "${name}-browser" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"; then
+        echo "  Browser: running (VNC on port 6901)" >&2
+    else
+        echo "  Browser: not running" >&2
+    fi
+
+    if [[ -f "${BOX_STATE_DIR}/${name}/state" ]]; then
+        local BNAME="" BIP="" CREATED_AT="" USE_PID_NS=""
+        # shellcheck source=/dev/null
+        source "${BOX_STATE_DIR}/${name}/state"
+        echo "  Created: ${CREATED_AT:-unknown}" >&2
+        echo "  PID namespace: ${USE_PID_NS:-false}" >&2
+    fi
+}
+
+cmd_stop() {
+    local remove=false name=""
+    for arg in "$@"; do
+        case "${arg}" in --rm) remove=true ;; *) name="${arg}" ;; esac
+    done
+    [[ -n "${name}" ]] || { echo "Usage: ensure-box stop [--rm] <box_name>" >&2; exit 1; }
+
+    echo "→ Stopping box '${name}' …" >&2
+
+    local sock="${TMUX_SOCKET_DIR}/${name}/tmux.sock"
+    if [[ -S "${sock}" ]]; then
+        echo "  Killing tmux server …" >&2
+        HOME="${BOX_HOME}" tmux -f "${TMUX_CONF}" -S "${sock}" kill-server 2>/dev/null || true
+        sleep 0.5
+    fi
+    rm -rf "${TMUX_SOCKET_DIR:?}/${name}"
+
+    stop_browser "${name}"
+    destroy_netns "${name}"
+    rm -rf "${BOX_STATE_DIR:?}/${name}"
+
+    if [[ "${remove}" == "true" ]]; then
+        echo "→ Releasing IP allocation …" >&2
+        free_ip "${name}"
+    else
+        echo "  IP allocation preserved — use --rm to release it." >&2
+    fi
+    echo "Box '${name}' stopped." >&2
+}
+
+# ── Ensure (create + enter) ────────────────────────────────────────────────
+
+cmd_ensure() {
+    _resolve_work_dir
+    _build_dbus_env
+
+    if box_exists; then
+        read_box_state
+        if [[ -f "/var/run/netns/${BOX_NAME}" ]]; then
+            echo "→ Box '${BOX_NAME}' already exists; re-entering …" >&2
+            [[ "${BROWSER}" == "true" ]] && launch_browser "${BOX_NAME}" "${BROWSER_PORT}"
+            if [[ "${USE_MACVLAN}" == "true" ]]; then
+                enter_box "${BOX_NAME}" "${SHELL_CMD:-}"
+            else
+                enter_box_host "${BOX_NAME}" "${SHELL_CMD:-}"
+            fi
+            return 0
+        fi
+        echo "→ Box '${BOX_NAME}' state exists but namespace is gone; recreating …" >&2
+    fi
+
+    if [[ "${USE_MACVLAN}" == "true" ]]; then
+        BOX_IP=$(allocate_ip "${BOX_NAME}") || exit 1
+        echo "Allocated IP: ${BOX_IP}" >&2
+        create_netns "${BOX_NAME}" "${BOX_IP}"
+    else
+        BOX_IP="host"
+    fi
+
+    mark_box_created
+    [[ "${BROWSER}" == "true" ]] && launch_browser "${BOX_NAME}" "${BROWSER_PORT}"
+
+    if [[ "${USE_MACVLAN}" == "true" ]]; then
+        enter_box "${BOX_NAME}" "${SHELL_CMD:-}"
+    else
+        enter_box_host "${BOX_NAME}" "${SHELL_CMD:-}"
+    fi
+}
+
+# ── CLI parsing ────────────────────────────────────────────────────────────
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)     usage ;;
+            --pid)         USE_PID_NS=true; shift ;;
+            --no-tmux)     USE_TMUX=false; shift ;;
+            --no-enter)    NO_ENTER=true; shift ;;
+            --dir)         WORK_DIR="$2"; shift 2 ;;
+            --browser)     BROWSER=true; shift ;;
+            --browser-port) BROWSER_PORT="$2"; shift 2 ;;
+            -c|--command)  SHELL_CMD="$2"; shift 2 ;;
+            --)            shift; break ;;
+            -*)            echo "ERROR: unknown flag '$1'" >&2; usage ;;
+            *)             break ;;
+        esac
+    done
+
+    if [[ $# -eq 1 ]]; then
+        case "$1" in
+            list|ls|status|st|stop|down|enter|start|up) ACTION="$1"; BOX_NAME="" ;;
+            *) ACTION="enter"; BOX_NAME="$1" ;;
+        esac
+    elif [[ $# -ge 2 ]]; then
+        ACTION="$1"; BOX_NAME="$2"
+    else
+        ACTION="enter"; BOX_NAME=""
+    fi
+}
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+main() {
+    load_config
+    parse_args "$@"
+
+    # list and status are read-only and do not require root.
+    # All other actions (enter, start, up, stop, down) require root.
+    case "${ACTION}" in
+        list|ls)              cmd_list ;;
+        status|st)            cmd_status "${BOX_NAME:?box name required}" ;;
+        stop|down)            [[ "${EUID:-}" -eq 0 ]] || die "must run as root. Use: sudo ensure-box stop <box_name>"; shift; cmd_stop "$@" ;;
+        enter|start|up)       [[ "${EUID:-}" -eq 0 ]] || die "must run as root. Use: sudo ensure-box [flags] <box_name>"; BOX_NAME="${BOX_NAME:?box name required}"; cmd_ensure ;;
+        *)                    die "unknown action '${ACTION}'. Usage: ensure-box [flags] <box_name>" ;;
+    esac
+}
+
+main "$@"

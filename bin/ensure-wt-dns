@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# ensure-wt-dns — one-time local DNS setup for wt-box (*.wt.test names).
+#
+# Installs and configures dnsmasq as a tiny local resolver that serves
+# worktree-box names from /etc/wt-boxes.d/ (hostsdir — wt-box rewrites that
+# file on every up/down; dnsmasq picks up changes by itself).
+#
+# systemd-resolved gets a route-only domain drop-in so only *.wt.test
+# queries go to dnsmasq; everything else still goes to Tailscale's MagicDNS.
+# This survives Tailscale's resolv.conf overwrites because nsswitch
+# consults resolved before files/dns.
+#
+# Idempotent — safe to re-run.  Must be run as root (sudo ensure-wt-dns).
+
+set -euo pipefail
+
+HOSTS_DIR="/etc/wt-boxes.d"
+DNSMASQ_DROPIN="/etc/dnsmasq.d/wt-boxes.conf"
+RESOLVED_DROPIN="/etc/systemd/resolved.conf.d/wt-boxes.conf"
+BOX_USER="notpc"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+[[ "$(id -u)" == "0" ]] || die "must run as root — use 'sudo ensure-wt-dns'."
+
+# ── dnsmasq ────────────────────────────────────────────────────────────────
+
+if ! pacman -Q dnsmasq >/dev/null 2>&1; then
+    echo "==> installing dnsmasq"
+    pacman -S --needed --noconfirm dnsmasq
+fi
+
+mkdir -p /etc/dnsmasq.d "${HOSTS_DIR}"
+# wt-box runs as the unprivileged user and rewrites the hostsdir file, so
+# hand the directory to it.  dnsmasq only needs to read (755/644).
+chown "${BOX_USER}:${BOX_USER}" "${HOSTS_DIR}"
+chmod 755 "${HOSTS_DIR}"
+[[ -f "${HOSTS_DIR}/wt-boxes.hosts" ]] || install -m 644 -o "${BOX_USER}" -g "${BOX_USER}" /dev/null "${HOSTS_DIR}/wt-boxes.hosts"
+
+cat > "${DNSMASQ_DROPIN}" <<'EOF'
+# wt-box: serve *.wt.test worktree names from /etc/wt-boxes.d/
+# 127.0.0.1:53 is free — systemd-resolved's stub listens on 127.0.0.53.
+listen-address=127.0.0.1
+bind-interfaces
+no-resolv
+server=100.100.100.100
+hostsdir=/etc/wt-boxes.d
+EOF
+echo "==> wrote ${DNSMASQ_DROPIN}"
+
+# The stock /etc/dnsmasq.conf is all comments; make sure it pulls in our
+# drop-in directory.
+if ! grep -qE '^\s*conf-dir=' /etc/dnsmasq.conf 2>/dev/null; then
+    echo 'conf-dir=/etc/dnsmasq.d/,*.conf' >> /etc/dnsmasq.conf
+    echo "==> enabled conf-dir in /etc/dnsmasq.conf"
+fi
+
+# ── systemd-resolved routing ───────────────────────────────────────────────
+
+mkdir -p /etc/systemd/resolved.conf.d
+cat > "${RESOLVED_DROPIN}" <<'EOF'
+# wt-box: route only *.wt.test to the local dnsmasq (route-only domain).
+[Resolve]
+DNS=127.0.0.1
+Domains=~wt.test
+EOF
+echo "==> wrote ${RESOLVED_DROPIN}"
+
+systemctl enable --now dnsmasq
+systemctl restart systemd-resolved
+
+# ── self-test ──────────────────────────────────────────────────────────────
+
+echo "==> self-test: resolving selftest.wt.test via dnsmasq"
+printf '127.0.0.1\tselftest.wt.test\n' >> "${HOSTS_DIR}/wt-boxes.hosts"
+sleep 1   # give dnsmasq a moment to notice the hostsdir change
+if resolvectl query selftest.wt.test 2>/dev/null | grep -q '127\.0\.0\.1'; then
+    echo "==> OK: *.wt.test resolves through dnsmasq"
+else
+    die "self-test failed — 'resolvectl query selftest.wt.test' did not return 127.0.0.1.
+       Check: systemctl status dnsmasq, resolvectl status"
+fi
+sed -i '/selftest\.wt\.test/d' "${HOSTS_DIR}/wt-boxes.hosts"
+
+echo
+echo "Done.  Use 'wt-box up' inside any linked git worktree."

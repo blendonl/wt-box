@@ -1,0 +1,633 @@
+#!/usr/bin/env bash
+# box-lite — lightweight project picker for the *default* tmux server.
+#
+# box-picker starts one tmux server per project, each running inside that
+# box's network namespace.  box-lite keeps every project as a plain session
+# on the single default tmux server instead, so switching projects is a
+# switch-client (instant) rather than a detach/attach dance, and `tmux ls`
+# shows everything in one place.
+#
+# Network isolation is opt-in *per project* and applies per pane: an isolated
+# session's default-command re-enters the box's netns for every new shell, so
+# the shared server itself never leaves the host network.
+#
+#   enter   → shared session   "<project>"       host network, instant
+#   ctrl-i  → isolated session "<project>@net"   own LAN IP via ensure-box
+#             (alt-i does the same; terminals send Ctrl-I as Tab, so Tab too)
+#   ctrl-b  → launch/report the box's browser container
+#   ctrl-x  → kill this project's sessions
+#   ctrl-k  → stop the box entirely (netns + browser; IP stays reserved)
+#
+# The shared and isolated sessions coexist — picking one never disturbs the
+# other, and neither is ever recreated behind your back.
+#
+# Non-interactive modes:
+#   box-lite --list                     TSV: display, box, worktree, ip,
+#                                       shared, isolated, netns
+#   box-lite --ensure <name> [--isolate] [--dir PATH]
+#                                       create the session, print its name
+#   box-lite --switch <session>         attach to / switch a client to it
+#   box-lite --preview <box> <wt>       fzf preview helper (internal)
+#   box-lite --exec-shell <tmux> <pane> netns shell entry (internal, root)
+
+set -euo pipefail
+
+SCRIPT_PATH="$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
+
+# ── Internal: shell entry inside a box's netns ─────────────────────────────
+# Invoked as root by `ensure-box -c` (see netns_enter_cmd) once the process is
+# already inside the namespace.  We drop back to the user here.  sudo strips
+# the tmux client variables on the way in, so they are handed back as
+# arguments — without them, tmux commands run inside the pane would not know
+# they are in a session.  Must stay above everything else: it runs as root.
+
+if [[ "${1:-}" == "--exec-shell" ]]; then
+    _env=(HOME=/home/notpc "PATH=${PATH}")
+    [[ -n "${2:-}" ]] && _env+=("TMUX=$2")
+    [[ -n "${3:-}" ]] && _env+=("TMUX_PANE=$3")
+    for _v in TERM COLORTERM XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS; do
+        [[ -n "${!_v:-}" ]] && _env+=("${_v}=${!_v}")
+    done
+    exec sudo -u notpc env "${_env[@]}" /usr/bin/zsh -l
+fi
+
+# ── Container detection ────────────────────────────────────────────────────
+# Inside a dev container, bridge to the host via tmux so discovery and box
+# state come from the host (same pattern as box-picker / project-picker).
+
+_in_container=false
+[[ -n "${CONTAINER_ID:-}" ]] && _in_container=true
+[[ -n "${DISTROBOX_ENTER:-}" ]] && _in_container=true
+[[ -f /run/.containerenv ]] && _in_container=true
+
+if $_in_container; then
+    if [[ -z "${TMUX:-}" ]]; then
+        echo "ERROR: Running inside a container but outside tmux." >&2
+        echo "       'box-lite' needs a tmux session to bridge to the host." >&2
+        exit 1
+    fi
+    # ${TMUX%%,*} extracts the socket path from "path,pid,clientid".
+    exec tmux -S "${TMUX%%,*}" display-popup -h 30 -w 100 -E "${SCRIPT_PATH} $*"
+fi
+
+# ── Config ─────────────────────────────────────────────────────────────────
+
+ENSURE_BOX="$HOME/bin/ensure-box"
+VNC_PW_CMD="$HOME/bin/box-vnc-pw"
+PROJECT_ROOTS=("/mnt/data/personal" "/mnt/data/work" "$HOME/projects")
+# How deep below a project root a repo may sit.  A directory at this depth is
+# still checked for .git, so this matches the old `find -maxdepth 5`.
+WALK_MAXDEPTH=4
+MACVLAN_CONF="/etc/podman/ensure-compose.conf"
+IP_STATE_FILE="/tmp/compose/ip-allocations.txt"
+BOX_STATE_DIR="/tmp/ensure-box"
+NETNS_DIR="/var/run/netns"
+ISO_SUFFIX="@net"
+BROWSER_PORT=6901
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+INTERACTIVE=0   # set once the picker is driving a terminal, so errors pause
+
+die() {
+    echo "ERROR: $*" >&2
+    [[ "$INTERACTIVE" == "1" ]] && pause
+    exit 1
+}
+
+# Every tmux call goes to the default server explicitly: box-lite may be run
+# from inside a legacy per-box server, where a bare `tmux` would target that
+# server instead.
+tm() { tmux -L default "$@"; }
+
+# Single-quote a string for safe interpolation into a shell command.
+shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+netns_up() { [[ -e "${NETNS_DIR}/$1" ]]; }
+
+resolve_absolute() {
+    local base="$1" rel="$2"
+    if [[ "$rel" == /* ]]; then
+        echo "$rel"
+    else
+        realpath "$base/$rel" 2>/dev/null \
+            || readlink -f "$base/$rel" 2>/dev/null \
+            || { cd "$base" && cd "$rel" 2>/dev/null && pwd -P; } \
+            || echo "$base/$rel"
+    fi
+}
+
+# ── Git project discovery ──────────────────────────────────────────────────
+
+walk_git_paths() {
+    # Emit "<dir>/.git" for every repo under PROJECT_ROOTS, breadth-first.
+    #
+    # PROJECT_ROOTS live on an NFS mount, so every directory descended into is
+    # a network round-trip.  The `find -maxdepth 5` this replaced walked ~9500
+    # directories — 3.7 s cold, 230 ms warm — to turn up 43 repos, because it
+    # kept descending *through* each project's source tree looking for more.
+    #
+    # A directory holding a .git is a project, so record it and never look
+    # inside: 39 directories read instead of 9500, same depth reach, and the
+    # emitted set is identical.  Nothing is lost because the only .git entries
+    # below that boundary were linked worktrees under .worktrees/ and
+    # .claude/worktrees/, every one of which discover_projects already
+    # collapsed back onto its parent repo.
+    local -a queue=("${PROJECT_ROOTS[@]}") next
+    local depth=0 dir sub
+
+    while (( ${#queue[@]} )); do
+        next=()
+        for dir in "${queue[@]}"; do
+            if [[ -e "$dir/.git" ]]; then
+                printf '%s\n' "$dir/.git"
+                continue
+            fi
+            (( depth < WALK_MAXDEPTH )) || continue
+            # */ matches directories only; on no match it stays literal, which
+            # the -d test rejects (cheaper than toggling nullglob per level).
+            # -L is skipped to match find's default of not following symlinks:
+            # descending them would risk loops and duplicate discovery.
+            for sub in "$dir"/*/; do
+                sub="${sub%/}"
+                [[ -d "$sub" && ! -L "$sub" ]] || continue
+                case "${sub##*/}" in
+                    node_modules|.venv|.cache|target|vendor) continue ;;
+                esac
+                next+=("$sub")
+            done
+        done
+        queue=("${next[@]}")
+        # Not (( depth++ )): that evaluates to the *old* value, so the first
+        # increment returns 0 and set -e aborts the walk.
+        depth=$(( depth + 1 ))
+    done
+}
+
+discover_projects() {
+    # Emits TSV: DISPLAY <TAB> box_name <TAB> worktree_path, one line per repo
+    # (deduplicated by shared git dir, so worktrees collapse onto their repo).
+    #
+    # DISPLAY keeps the project root ("personal/cadence") so the picker can
+    # still tell personal from work apart.  box_name drops it ("cadence"),
+    # because that name is the tmux session you look at all day.  Everything
+    # below the root is kept, so personal/raw/rawaccel is "raw-rawaccel" and
+    # never collides with personal/rawaccel.
+    #
+    # Hot path: ~50 repos.  Everything here is a bash builtin — no dirname,
+    # realpath, basename or `git rev-parse` per repo, since forking three
+    # processes per repo cost about a second all by itself.
+    # The =() matters: under set -u a declared-but-never-assigned associative
+    # array is "unbound", so iterating it below would abort the script whenever
+    # the walk turned up no repos at all.
+    declare -A seen_shared=()
+    # box_name → how many repos want it, so a name two roots both claim can be
+    # spotted after the walk and handed back its root prefix.
+    declare -A name_count=()
+
+    while IFS= read -r gitpath; do
+        local wt_dir shared display="" name="" root rel gd
+
+        wt_dir="${gitpath%/.git}"
+        if [[ -d "$gitpath" ]]; then
+            # Primary worktree: <repo>/.git is the shared git dir itself.
+            shared="$gitpath"
+        else
+            # Linked worktree: <wt>/.git is a file "gitdir: <repo>/.git/worktrees/<n>".
+            # Submodules point at <repo>/.git/modules/<n> and are left as-is,
+            # which collapses them onto the parent repo below — same as
+            # `git rev-parse --git-common-dir` used to do, minus the fork.
+            # read reports EOF (non-zero) on a file with no trailing newline
+            # even though it did assign, so judge on the value, not the status.
+            read -r _ gd < "$gitpath" 2>/dev/null || true
+            [[ -z "$gd" ]] && continue
+            if [[ "$gd" != /* ]]; then
+                # Relative gitdir (rare): fall back to asking git.
+                gd=$(cd "$wt_dir" && git rev-parse --git-common-dir 2>/dev/null) || continue
+                gd=$(resolve_absolute "$wt_dir" "$gd")
+            fi
+            shared="${gd%/worktrees/*}"
+        fi
+
+        [[ -n "${seen_shared[$shared]:-}" ]] && continue
+
+        # Prefer the primary worktree over whichever one find hit first: the
+        # shared git dir is "<repo>/.git", so its parent is the repo root.
+        # (Linked worktrees under .worktrees/ or .claude/worktrees/ otherwise
+        # win the race and the session would start in a stale branch dir.)
+        if [[ "$shared" == */.git && -d "${shared%/.git}" ]]; then
+            wt_dir="${shared%/.git}"
+        fi
+
+        for root in "${PROJECT_ROOTS[@]}"; do
+            if [[ "$shared" == "$root/"* ]]; then
+                rel="${shared#"$root/"}"
+                rel="${rel%%/.git*}"    # "cadence", or "raw/rawaccel" if nested
+                display="${root##*/}/${rel}"
+                name="${rel//\//-}"
+                break
+            fi
+        done
+        if [[ -z "$display" ]]; then
+            rel="${shared%/*}"          # strip "/.git"
+            display="${rel##*/}"        # basename of the repo root
+            name="$display"
+        fi
+
+        name_count["$name"]=$(( ${name_count["$name"]:-0} + 1 ))
+        seen_shared[$shared]="${display}"$'\t'"${name}"$'\t'"${wt_dir}"
+    done < <(walk_git_paths)
+
+    local entry d n w
+    for entry in "${seen_shared[@]}"; do
+        IFS=$'\t' read -r d n w <<< "$entry"
+        # personal/foo and work/foo would otherwise share one session, one
+        # netns and one IP; keep the root on both so they stay distinct.
+        (( ${name_count[$n]:-0} > 1 )) && n="${d//\//-}"
+        printf '%s\t%s\t%s\n' "$d" "$n" "$w"
+    done | sort -u
+}
+
+# ── State (sessions + IP allocations) ──────────────────────────────────────
+# Deliberately cheap: one tmux call plus two file reads, no podman.  Slower
+# per-box details (browser state) are looked up lazily in the fzf preview.
+
+declare -A SESS_WIN SESS_ATT BOX_IP
+
+load_state() {
+    local n w a ip
+    while IFS=$'\t' read -r n w a; do
+        [[ -z "$n" ]] && continue
+        SESS_WIN["$n"]="$w"
+        SESS_ATT["$n"]="$a"
+    done < <(tm list-sessions \
+        -F '#{session_name}'$'\t''#{session_windows}'$'\t''#{session_attached}' \
+        2>/dev/null || true)
+
+    if [[ -f "${IP_STATE_FILE}" ]]; then
+        while read -r n ip; do
+            [[ -n "$n" ]] && BOX_IP["$n"]="$ip"
+        done < "${IP_STATE_FILE}"
+    fi
+}
+
+# Sets TAG to "2w", "2w*" (attached) or "-".  Returns through a global rather
+# than stdout because $(…) forks a subshell and this runs twice per row.
+TAG=""
+session_tag() {
+    local sess="$1"
+    TAG="-"
+    [[ -z "${SESS_WIN[$sess]:-}" ]] && return 0
+    TAG="${SESS_WIN[$sess]}w"
+    [[ "${SESS_ATT[$sess]:-0}" == "1" ]] && TAG+="*"
+    return 0
+}
+
+emit_row() {
+    # display <TAB> box <TAB> worktree  →  padded fzf line + hidden fields.
+    local display="$1" box="$2" wt="$3"
+    local shared iso ip ns
+    session_tag "$box";                shared="$TAG"
+    session_tag "${box}${ISO_SUFFIX}"; iso="$TAG"
+    ip="${BOX_IP[$box]:--}"
+    ns="-"
+    netns_up "$box" && ns="up"
+
+    printf '%-34s %-7s %-8s %-16s %-5s\t%s\t%s\n' \
+        "$display" "$shared" "$iso" "$ip" "$ns" "$box" "$wt"
+}
+
+# ── Session management ─────────────────────────────────────────────────────
+
+session_exists() { tm has-session -t "=$1" 2>/dev/null; }
+
+# The default server inherits the network namespace of whoever starts it.
+# Launching it from inside a box (e.g. from a legacy box-picker session) would
+# quietly put *every* shared session on that box's network, so refuse instead.
+guard_server_netns() {
+    local ns
+    tm list-sessions >/dev/null 2>&1 && return 0        # server already up
+    ns=$(ip netns identify 2>/dev/null || true)
+    [[ -z "$ns" ]] && return 0
+    die "no default tmux server yet, and this shell is inside netns '${ns}'.
+       Starting it here would trap every shared session on ${ns}'s network.
+       Start tmux once from a host terminal, then run box-lite again."
+}
+
+# The command every pane of an isolated session runs.  Layers, outside in:
+#   1. tmux runs this string with `zsh -c` in the new pane's directory —
+#      $(pwd) and $TMUX expand here, before sudo strips them.
+#   2. ensure-box (NOPASSWD in /etc/sudoers.d/ensure-box) creates the netns if
+#      it is missing and execs the -c command inside it, as root.
+#   3. box-lite --exec-shell drops back to notpc with the tmux vars restored.
+# If any of that fails the pane falls back to a host shell instead of dying.
+netns_enter_cmd() {
+    local box="$1"
+    local inner="${SCRIPT_PATH} --exec-shell '\$TMUX' '\$TMUX_PANE'"
+    printf '%s' \
+        "sudo -n ${ENSURE_BOX} --dir \"\$(pwd)\" -c \"${inner}\" $(shq "$box") \
+|| { echo '[box-lite] netns entry failed — host shell' >&2; exec /usr/bin/zsh -l; }"
+}
+
+ensure_shared_session() {
+    local box="$1" wt="$2"
+    session_exists "$box" && return 0
+    guard_server_netns
+    [[ -d "$wt" ]] || wt="$HOME"
+    tm new-session -d -s "$box" -c "$wt"
+}
+
+ensure_isolated_session() {
+    local box="$1" wt="$2"
+    local sess="${box}${ISO_SUFFIX}" cmd
+
+    [[ -f "${MACVLAN_CONF}" ]] \
+        || die "no macvlan config at ${MACVLAN_CONF} — run 'sudo ensure-macvlan' first."
+    session_exists "$sess" || guard_server_netns
+
+    # Netns + IP only; no per-box tmux server, no browser.
+    sudo -n "${ENSURE_BOX}" --no-tmux --no-enter --dir "$wt" "$box" \
+        || die "ensure-box failed to bring up '${box}'."
+
+    cmd=$(netns_enter_cmd "$box")
+    if ! session_exists "$sess"; then
+        tm new-session -d -s "$sess" -c "$wt" "$cmd"
+    fi
+    # Every new window/pane must re-enter the netns too, so default-command is
+    # refreshed on each entry.  Note: set-option takes a pane target, which
+    # does not accept the "=" exact-match prefix used elsewhere.
+    tm set-option -t "$sess" default-command "$cmd" \
+        || die "could not set default-command on '${sess}' — new panes would not be isolated."
+}
+
+attach_or_switch() {
+    local sess="$1" cur_sock def_sock client
+
+    if [[ -z "${TMUX:-}" ]]; then
+        exec tmux -L default attach-session -t "=${sess}"
+    fi
+
+    # Running inside some other tmux server (a legacy per-box one): detach
+    # from it and attach to the default server in the freed terminal.
+    cur_sock="${TMUX%%,*}"
+    def_sock=$(tm display-message -p '#{socket_path}' 2>/dev/null || true)
+    if [[ -n "$def_sock" && "$cur_sock" != "$def_sock" ]]; then
+        tmux -S "$cur_sock" detach-client \
+            -E "tmux -L default attach-session -t $(shq "=${sess}")"
+        return 0
+    fi
+
+    client=$(tm display-message -p '#{client_name}' 2>/dev/null || true)
+    if [[ -n "$client" ]]; then
+        tm switch-client -c "$client" -t "=${sess}"
+    else
+        tm switch-client -t "=${sess}"
+    fi
+}
+
+# ── Interactive extras ─────────────────────────────────────────────────────
+
+pause() { printf '\n[any key to close] ' >&2; read -rsn1 _ || true; printf '\n' >&2; }
+
+confirm() {
+    local ans
+    printf '%s [y/N] ' "$1" >&2
+    read -r ans || true
+    [[ "$ans" == [yY]* ]]
+}
+
+do_browser() {
+    local box="$1" wt="$2" ip pw
+    [[ -f "${MACVLAN_CONF}" ]] || die "no macvlan config — browser needs ensure-macvlan."
+    sudo -n "${ENSURE_BOX}" --browser --browser-port "${BROWSER_PORT}" \
+        --no-tmux --no-enter --dir "$wt" "$box" || true
+    ip=$(grep "^${box} " "${IP_STATE_FILE}" 2>/dev/null | awk '{print $2}' || true)
+    pw=$("${VNC_PW_CMD}" 2>/dev/null || echo '?')
+    [[ -n "$ip" ]] && echo "  → https://${ip}:${BROWSER_PORT}  (password: ${pw})" >&2
+    pause
+}
+
+do_kill_sessions() {
+    local box="$1" found=false s
+    for s in "$box" "${box}${ISO_SUFFIX}"; do
+        session_exists "$s" && found=true
+    done
+    if ! $found; then
+        echo "No sessions for '${box}'." >&2
+        pause
+        return 0
+    fi
+    confirm "Kill tmux sessions for '${box}'?" || return 0
+    for s in "$box" "${box}${ISO_SUFFIX}"; do
+        session_exists "$s" && tm kill-session -t "=$s" 2>/dev/null || true
+    done
+}
+
+do_stop_box() {
+    local box="$1" s
+    if ! netns_up "$box" && [[ ! -d "${BOX_STATE_DIR}/${box}" ]]; then
+        echo "Box '${box}' is not running." >&2
+        pause
+        return 0
+    fi
+    confirm "Stop box '${box}' (netns + browser) and kill its sessions?" || return 0
+    for s in "$box" "${box}${ISO_SUFFIX}"; do
+        session_exists "$s" && tm kill-session -t "=$s" 2>/dev/null || true
+    done
+    sudo -n "${ENSURE_BOX}" stop "$box" || true
+    pause
+}
+
+# ── Preview (runs per highlighted row, so it may be a little slower) ───────
+
+cmd_preview() {
+    local box="${1:-}" wt="${2:-}"
+    [[ -z "$box" ]] && return 0
+    load_state
+
+    printf '%s\n' "${box}"
+    printf '  worktree : %s\n' "${wt:-–}"
+    session_tag "$box"
+    printf '  shared   : %-24s %s\n' "$box" "$TAG"
+    session_tag "${box}${ISO_SUFFIX}"
+    printf '  isolated : %-24s %s\n' "${box}${ISO_SUFFIX}" "$TAG"
+
+    if netns_up "$box"; then
+        printf '  netns    : up   ip %s\n' "${BOX_IP[$box]:-?}"
+        # Only worth a sudo round-trip once the box actually exists.
+        if sudo -n "${ENSURE_BOX}" status "$box" 2>&1 | grep -q "Browser: running"; then
+            printf '  browser  : running → https://%s:%s\n' "${BOX_IP[$box]:-?}" "${BROWSER_PORT}"
+        else
+            printf '  browser  : stopped\n'
+        fi
+    else
+        printf '  netns    : down %s\n' \
+            "$([[ -n "${BOX_IP[$box]:-}" ]] && echo "(ip ${BOX_IP[$box]} reserved)" || echo "")"
+    fi
+}
+
+# ── Non-interactive modes ──────────────────────────────────────────────────
+
+cmd_list() {
+    load_state
+    local display box wt ip ns
+    declare -A emitted
+
+    local shared iso
+    while IFS=$'\t' read -r display box wt; do
+        [[ -z "$box" ]] && continue
+        emitted["$box"]=1
+        ip="${BOX_IP[$box]:--}"
+        ns="down"; netns_up "$box" && ns="up"
+        session_tag "$box";                shared="$TAG"
+        session_tag "${box}${ISO_SUFFIX}"; iso="$TAG"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$display" "$box" "$wt" "$ip" "$shared" "$iso" "$ns"
+    done < <(discover_projects)
+
+    # Sessions on the default server with no matching project.
+    for box in "${!SESS_WIN[@]}"; do
+        local base="${box%"${ISO_SUFFIX}"}"
+        [[ -n "${emitted[$base]:-}" ]] && continue
+        emitted["$base"]=1
+        ns="down"; netns_up "$base" && ns="up"
+        session_tag "$base";                shared="$TAG"
+        session_tag "${base}${ISO_SUFFIX}"; iso="$TAG"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$base" "$base" "-" "${BOX_IP[$base]:--}" "$shared" "$iso" "$ns"
+    done
+}
+
+cmd_ensure() {
+    local target="${1:-}" isolate=false dir=""
+    shift || true
+    [[ -z "$target" ]] && die "--ensure requires a project or box name"
+    local raw="$target"
+    target="${target//\//-}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --isolate) isolate=true; shift ;;
+            --dir)     dir="${2:?--dir requires a path}"; shift 2 ;;
+            *)         die "unknown --ensure flag '$1'" ;;
+        esac
+    done
+
+    # The box name ("cadence") is matched first, but the display name
+    # ("personal/cadence") is accepted too — that is what the picker lists, and
+    # since box names dropped the root the two forms are no longer the same
+    # string.  A hit rewrites the target so the session comes out short.
+    if [[ -z "$dir" ]]; then
+        local display box wt
+        while IFS=$'\t' read -r display box wt; do
+            if [[ "$box" == "$target" || "$display" == "$raw" \
+                || "${display//\//-}" == "$target" ]]; then
+                target="$box"; dir="$wt"; break
+            fi
+        done < <(discover_projects)
+    fi
+    [[ -z "$dir" ]] && dir="$HOME"
+
+    if $isolate; then
+        ensure_isolated_session "$target" "$dir" >&2
+        printf '%s\n' "${target}${ISO_SUFFIX}"
+    else
+        ensure_shared_session "$target" "$dir"
+        printf '%s\n' "$target"
+    fi
+}
+
+# Companion pickers (switch-worktree-lite) create their session with --ensure
+# and then hand the name back here, so the attach/switch dance — including the
+# detach-and-reattach needed when the caller sits on a legacy per-box server —
+# is not reimplemented anywhere else.
+cmd_switch() {
+    local sess="${1:-}"
+    [[ -z "$sess" ]] && die "--switch requires a session name"
+    session_exists "$sess" || die "no session named '${sess}' on the default server"
+    attach_or_switch "$sess"
+}
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+main() {
+    case "${1:-}" in
+        --preview) shift; cmd_preview "$@"; exit 0 ;;
+        --list)    cmd_list; exit 0 ;;
+        --ensure)  shift; cmd_ensure "$@"; exit 0 ;;
+        --switch)  shift; cmd_switch "$@"; exit 0 ;;
+        --help|-h) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        "")        ;;
+        *)         die "unknown argument '$1' (try --help)" ;;
+    esac
+
+    command -v fzf >/dev/null 2>&1 || die "fzf is required.  sudo pacman -S fzf"
+
+    INTERACTIVE=1   # from here on we own a terminal: let errors be readable
+    load_state
+
+    local input display box wt
+    input=$(mktemp /tmp/box-lite.XXXXXX)
+    trap 'rm -f "${input}"' EXIT
+
+    declare -A emitted
+    while IFS=$'\t' read -r display box wt; do
+        [[ -z "$box" ]] && continue
+        emitted["$box"]=1
+        emit_row "$display" "$box" "$wt"
+    done < <(discover_projects) >> "${input}"
+
+    # Sessions that are not git projects (scratch sessions, orphan boxes) are
+    # listed too — on a shared server the picker doubles as a session switcher.
+    for box in "${!SESS_WIN[@]}"; do
+        local base="${box%"${ISO_SUFFIX}"}"
+        [[ -n "${emitted[$base]:-}" ]] && continue
+        emitted["$base"]=1
+        emit_row "$base" "$base" "-" >> "${input}"
+    done
+
+    [[ -s "${input}" ]] || die "no projects or sessions found under ${PROJECT_ROOTS[*]}"
+
+    local header
+    header=$(printf '%-34s %-7s %-8s %-16s %-5s\n%s' \
+        "PROJECT" "SHARED" "ISOLATED" "IP" "NETNS" \
+        "enter:shared  ctrl-i:isolated  ctrl-b:browser  ctrl-x:kill  ctrl-k:stop")
+
+    local out key selection
+    out=$(sort -t$'\t' -k1 "${input}" \
+        | fzf --prompt="box> " \
+              --header="${header}" \
+              --delimiter=$'\t' \
+              --with-nth=1 \
+              --expect=ctrl-i,alt-i,ctrl-b,ctrl-x,ctrl-k \
+              --preview="$(shq "${SCRIPT_PATH}") --preview {2} {3}" \
+              --preview-window=down:8:wrap) || exit 0
+
+    key=$(printf '%s' "$out" | head -1)
+    selection=$(printf '%s' "$out" | sed -n '2p')
+    [[ -z "$selection" ]] && exit 0
+
+    box=$(printf '%s' "$selection" | awk -F'\t' '{print $2}')
+    wt=$(printf '%s' "$selection" | awk -F'\t' '{print $3}')
+    [[ -z "$box" ]] && exit 0
+
+    case "$key" in
+        ctrl-x) do_kill_sessions "$box"; exit 0 ;;
+        ctrl-k) do_stop_box "$box"; exit 0 ;;
+        ctrl-b)
+            [[ "$wt" == "-" ]] && wt="$HOME"
+            do_browser "$box" "$wt"; exit 0 ;;
+        ctrl-i|alt-i)
+            # Terminals send the same byte for Ctrl-I and Tab, so Tab isolates
+            # too; alt-i is the collision-free alternative.
+            [[ "$wt" == "-" ]] && die "'${box}' has no worktree — cannot isolate."
+            ensure_isolated_session "$box" "$wt"
+            attach_or_switch "${box}${ISO_SUFFIX}" ;;
+        *)
+            [[ "$wt" == "-" ]] && wt="$HOME"
+            ensure_shared_session "$box" "$wt"
+            attach_or_switch "$box" ;;
+    esac
+}
+
+main "$@"
